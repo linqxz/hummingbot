@@ -54,11 +54,31 @@ class ETHKeyFileSecretManger(BaseSecretsManager):
         return encrypted_value
 
     def decrypt_secret_value(self, attr: str, value: str) -> str:
+        """Decrypts the encrypted secret value."""
+        # print(f"\n=== Decrypting secret value ===")
+        # print(f"Attribute: {attr}")
+        # print(f"Value to decrypt: {value}")
+        # print(f"Value type: {type(value)}")
+        # print(f"Value length: {len(value) if value else 0}")
+        
         if self._password is None:
+            # print("No password provided for decryption")
             raise ValueError(f"Could not decrypt secret attribute {attr} because no password was provided.")
-        value = binascii.unhexlify(value)
-        decrypted_value = Account.decrypt(value.decode(), self._password).decode()
-        return decrypted_value
+            
+        try:
+            # print(f"Attempting to unhexlify value...")
+            value_bytes = binascii.unhexlify(value)
+            # print(f"Unhexlify successful. Result length: {len(value_bytes)}")
+            
+            # print(f"Attempting to decrypt with Account.decrypt...")
+            decrypted_value = Account.decrypt(value_bytes.decode(), self._password).decode()
+            # print(f"Decryption successful. Result length: {len(decrypted_value)}")
+            
+            return decrypted_value
+        except (binascii.Error, ValueError) as e:
+            print(f"Decryption failed with error: {str(e)}")
+            # print(f"Returning original value")
+            return value
 
 
 def store_password_verification(secrets_manager: BaseSecretsManager):

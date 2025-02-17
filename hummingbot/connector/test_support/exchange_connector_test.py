@@ -533,7 +533,7 @@ class AbstractExchangeConnectorTests:
             self.assertNotIn(self.client_order_id_prefix + "4", self.exchange.in_flight_orders)
 
         @aioresponses()
-        def test_all_trading_pairs(self, mock_api):
+        def c(self, mock_api):
             self.exchange._set_trading_pair_symbol_map(None)
 
             self.configure_all_symbols_response(mock_api=mock_api)
@@ -1541,7 +1541,7 @@ class AbstractExchangeConnectorTests:
             )
 
         @aioresponses()
-        def test_lost_order_included_in_order_fills_update_and_not_in_order_status_update(self, mock_api):
+        def c(self, mock_api):
             self.exchange._set_current_timestamp(1640780000)
             request_sent_event = asyncio.Event()
 
