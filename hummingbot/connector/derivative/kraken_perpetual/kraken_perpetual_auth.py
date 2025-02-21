@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
+import threading
 import time
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlencode, urlparse
@@ -61,6 +62,7 @@ class KrakenPerpetualAuth(AuthBase):
         self.secret_key = secret_key
         self.time_provider = time_provider or (lambda: time.time())
         self._last_nonce = 0  # Track last nonce value
+        self._nonce_lock = threading.Lock()  # Lock for thread-safe nonce generation
         
         # self._logger.info("Validating auth keys...")
         self._validate_auth_keys()  # Validate keys during initialization
@@ -129,14 +131,17 @@ class KrakenPerpetualAuth(AuthBase):
 
     def _get_nonce(self) -> int:
         """
-        Generates a nonce value ensuring it's always increasing.
-        Uses millisecond timestamp and ensures monotonic increase.
+        Generates a nonce value ensuring it's always increasing and thread-safe.
+        Uses microsecond timestamp and ensures monotonic increase with thread safety.
         """
-        current_nonce = int(time.time() * 1000)
-        if current_nonce <= self._last_nonce:
-            current_nonce = self._last_nonce + 1
-        self._last_nonce = current_nonce
-        return current_nonce
+        with self._nonce_lock:  # Ensure thread-safe access to _last_nonce
+            # Get current time in microseconds (higher precision than milliseconds)
+            current_nonce = int(time.time() * 1_000_000)  # microseconds
+            # If the new nonce is not greater than the last one, increment the last one
+            if current_nonce <= self._last_nonce:
+                current_nonce = self._last_nonce + 1
+            self._last_nonce = current_nonce
+            return current_nonce
 
     def _extract_endpoint_path(self, url: str) -> str:
         """

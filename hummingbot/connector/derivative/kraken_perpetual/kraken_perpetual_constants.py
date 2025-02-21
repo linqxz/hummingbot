@@ -132,6 +132,7 @@ ORDER_STATE = {
     "untriggered": OrderState.PENDING_CREATE,
     "expired": OrderState.CANCELED,
     "ENTERED_BOOK": OrderState.OPEN,
+    "OPEN": OrderState.OPEN,
     "FULLY_EXECUTED": OrderState.FILLED,
     "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
     "filled": OrderState.FILLED,
@@ -149,6 +150,8 @@ ORDER_STATE = {
     "partial_fill": OrderState.PARTIALLY_FILLED,
     "full_fill": OrderState.FILLED,
     "cancelled_by_user": OrderState.CANCELED,
+    "cancelled_by_system": OrderState.CANCELED,
+    "cancelled_by_trigger": OrderState.CANCELED,
     "contract_expired": OrderState.CANCELED,
     "not_enough_margin": OrderState.FAILED,
     "market_inactive": OrderState.CANCELED,
@@ -263,3 +266,6 @@ ACCOUNT_LOG_COSTS = {
 }
 
 POSITION_IDX_ONEWAY = 0
+
+# REST endpoints
+SNAPSHOT_REST_URL = "/api/v3/orderbook"

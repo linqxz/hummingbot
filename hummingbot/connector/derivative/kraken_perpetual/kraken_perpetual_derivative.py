@@ -316,10 +316,11 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         if cancel_status.get("status") == "cancelled":
             # Create an order event message to process
             order_data = cancel_status["orderEvents"][0]["order"]
-            order_data["status"] = cancel_status["status"].upper()  # Add the status field and convert to uppercase
+            order_data["status"] = "CANCELED"  # Make sure this matches your ORDER_STATE mapping
             order_event = {
                 "order": order_data
             }
+            self.logger().debug(f"Processing cancellation event: {order_event}")
             self._process_order_event_message(order_event)
 
         # self.logger().info(f"Cancellation request sent successfully for order {order_id}")
@@ -338,7 +339,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
     ) -> Tuple[str, float]:
 
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        
+
         data = {
             "processBefore": str(self._get_process_before_timestamp()),
             "orderType": CONSTANTS.ORDER_TYPE_MAP[order_type].lower(),
@@ -479,33 +480,48 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Calls REST API to get order status
         """
-        self.logger().info("\n=== Updating Order Status via REST ===")
+        # self.logger().info("\n=== Updating Order Status via REST ===")
         active_orders: List[InFlightOrder] = list(self.in_flight_orders.values())
-        
+        # self.logger().info(f"Found {len(active_orders)} active orders to update")
+
         tasks = []
         for active_order in active_orders:
+            # self.logger().info(f"\nCreating status check task for order:"
+            #                  f"\n  Client order ID: {active_order.client_order_id}"
+            #                  f"\n  Exchange order ID: {active_order.exchange_order_id}"
+            #                  f"\n  Trading pair: {active_order.trading_pair}"
+            #                  f"\n  Current state: {active_order.current_state}")
             tasks.append(asyncio.create_task(self._request_order_status_data(tracked_order=active_order)))
 
+        # self.logger().info(f"Awaiting {len(tasks)} order status check tasks...")
         raw_responses: List[Dict[str, Any]] = await safe_gather(*tasks, return_exceptions=True)
 
         for resp, active_order in zip(raw_responses, active_orders):
             if not isinstance(resp, Exception):
+                # self.logger().info(f"\nProcessing response for order {active_order.client_order_id}")
                 if resp.get("result") == "success":
                     orders = resp.get("orders", [])
                     if orders:
+                        # self.logger().info(f"Order found in active orders - processing update: {orders[0]}")
                         # Order found in active orders - process normally
                         self._process_order_event_message({"order": orders[0]})
                     else:
                         # Order not found in active orders - check history as fallback
                         try:
-                            self.logger().info(f"Order {active_order.client_order_id} not found in active orders - checking history")
+                            # self.logger().info(f"Order {active_order.client_order_id} not found in active orders - checking history")
                             history_resp = await self._request_order_history_data(active_order)
-                            if history_resp.get("result") == "success" and history_resp.get("orders", []):
-                                self.logger().info(f"Found order {active_order.client_order_id} in history")
-                                # Use the historical processor since message format is different
-                                self._process_historical_order_event_message(history_resp["orders"][0])
+                            # self.logger().info(f"\n=== Historical Order Response ===\nOrder ID: {active_order.client_order_id}\nResponse: {history_resp}")
+                            if history_resp.get("result") == "success":
+                                events = history_resp.get("orders", [])
+                                # self.logger().info(f"Found {len(events)} events in history for order {active_order.client_order_id}")
+                                for event in events:
+                                    # self.logger().info(f"Processing historical event: {event}")
+                                    # Format the event to match expected structure
+                                    formatted_event = {"order": event}
+                                    self._process_historical_order_event_message(formatted_event)
                             else:
-                                self.logger().info(f"Order {active_order.client_order_id} not found in history - marking as not found")
+                                # self.logger().info(f"Order {active_order.client_order_id} not found in history - marking as not found")
+                                self.logger().warning(f"History response error: {history_resp.get('error', 'Unknown error')}")
                                 await self._order_tracker.process_order_not_found(active_order.client_order_id)
                         except Exception as e:
                             self.logger().error(f"Error checking history for order {active_order.client_order_id}: {str(e)}")
@@ -615,38 +631,123 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             else:
                 self._perpetual_trading.remove_position(pos_key)
 
+        # Trigger balance update because Kraken doesn't have balance updates through the websocket
+        safe_ensure_future(self._update_balances())
+
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates = []
 
         if order.exchange_order_id is not None:
             try:
-                all_fills_response = await self._request_order_fills(order=order)
-                fills_data = all_fills_response["result"].get("fills", [])
+                self.logger().debug(f"\n=== Fetching trade updates for order {order.client_order_id} ===")
+                self.logger().debug(f"Exchange Order ID: {order.exchange_order_id}")
+                self.logger().debug(f"Trading Pair: {order.trading_pair}")
 
-                if fills_data is not None:
-                    for fill_data in fills_data:
-                        trade_update = self._parse_trade_update(trade_msg=fill_data, tracked_order=order)
-                        trade_updates.append(trade_update)
+                all_fills_response = await self._request_order_fills(order=order)
+                self.logger().debug(f"Raw fills response: {all_fills_response}")
+                self.logger().debug(f"Response type: {type(all_fills_response)}")
+
+                # Handle string response (error case)
+                if isinstance(all_fills_response, str):
+                    self.logger().debug(f"Unexpected string response for order fills: {all_fills_response}")
+                    return trade_updates
+
+                # Handle non-dict response
+                if not isinstance(all_fills_response, dict):
+                    self.logger().debug(f"Unexpected response type: {type(all_fills_response)}. Expected dict.")
+                    return trade_updates
+
+                # Try to parse fills data
+                try:
+                    self.logger().debug("Attempting to extract fills data...")
+                    result = all_fills_response.get("result", {})
+                    self.logger().debug(f"Result field: {result}")
+
+                    fills_data = result.get("fills", []) if isinstance(result, dict) else []
+                    self.logger().debug(f"Extracted fills data: {fills_data}")
+                    self.logger().debug(f"Fills data type: {type(fills_data)}")
+
+                    if fills_data is not None:
+                        for fill_data in fills_data:
+                            self.logger().debug(f"Processing fill data: {fill_data}")
+                            trade_update = self._parse_trade_update(trade_msg=fill_data, tracked_order=order)
+                            self.logger().debug(f"Created trade update: {trade_update}")
+                            trade_updates.append(trade_update)
+                    else:
+                        self.logger().debug("No fills data found in response")
+
+                except AttributeError as ae:
+                    self.logger().error(f"Error accessing fills data: {str(ae)}", exc_info=True)
+                    return trade_updates
+
             except IOError as ex:
                 if not self._is_request_exception_related_to_time_synchronizer(request_exception=ex):
                     raise
+            except Exception as e:
+                self.logger().error(f"Unexpected error processing trade updates: {str(e)}", exc_info=True)
 
+        self.logger().debug(f"Returning {len(trade_updates)} trade updates")
         return trade_updates
 
     async def _request_order_fills(self, order: InFlightOrder) -> Dict[str, Any]:
         """Request order fills data from the exchange."""
-        exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
-        body_params = {
-            "orderId": order.exchange_order_id,
-            "symbol": exchange_symbol,
-        }
-        res = await self._api_get(
-            path_url=CONSTANTS.USER_TRADE_RECORDS_PATH_URL,
-            params=body_params,
-            is_auth_required=True,
-            trading_pair=order.trading_pair,
-        )
-        return res
+        try:
+            self.logger().debug(f"\n=== Requesting Order Fills ===\nOrder ID: {order.client_order_id}\nExchange Order ID: {order.exchange_order_id}")
+
+            exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+            self.logger().debug(f"Exchange Symbol: {exchange_symbol}")
+
+            body_params = {
+                "orderId": order.exchange_order_id,
+                "symbol": exchange_symbol,
+            }
+            self.logger().debug(f"Request Parameters: {body_params}")
+
+            res = await self._api_get(
+                path_url=CONSTANTS.USER_TRADE_RECORDS_PATH_URL,
+                params=body_params,
+                is_auth_required=True,
+                trading_pair=order.trading_pair,
+            )
+
+            self.logger().debug(f"Raw API Response: {res}")
+            self.logger().debug(f"Response Type: {type(res)}")
+
+            # Handle string response (usually error message)
+            if isinstance(res, str):
+                self.logger().warning(f"Received string response from fills request: {res}")
+                return {"result": "error", "fills": [], "error": res}
+
+            # Handle non-dict response
+            if not isinstance(res, dict):
+                self.logger().warning(f"Received unexpected response type: {type(res)}")
+                return {"result": "error", "fills": [], "error": f"Unexpected response type: {type(res)}"}
+
+            # Log response structure
+            if "fills" in res:
+                self.logger().debug(f"Number of fills in response: {len(res['fills'])}")
+                if res['fills']:
+                    self.logger().debug(f"Sample fill data: {res['fills'][0]}")
+            else:
+                self.logger().debug("No 'fills' key in response")
+
+            # Ensure the response has the expected structure
+            if "fills" not in res:
+                self.logger().debug("Converting response to standard format")
+                res = {"result": "success", "fills": res if isinstance(res, list) else []}
+
+            self.logger().debug(f"Final processed response: {res}")
+            return res
+
+        except Exception as e:
+            self.logger().error(f"Error requesting order fills: {str(e)}", exc_info=True)
+            if hasattr(e, 'response'):
+                try:
+                    error_response = await e.response.text()
+                    self.logger().error(f"Error response text: {error_response}")
+                except:
+                    pass
+            return {"result": "error", "fills": [], "error": str(e)}
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         try:
@@ -710,20 +811,21 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         Request order history data from the exchange.
         Filters events to only process those matching our client ID.
         Also fetches and processes fills for filled orders.
-        
+
         :param tracked_order: The InFlightOrder being tracked
         :return: Dictionary containing the order history response
         """
         try:
-            self.logger().info(f"\n=== Requesting Order History ===\nLooking for order: {tracked_order.client_order_id}")
-            
+            # self.logger().info(f"\n=== Requesting Order History ===\nLooking for order: {tracked_order.client_order_id}")
+
             # Prepare history request parameters
             history_params = {
-                "limit": 1000,  # Limit to last 1000 events
-                "sort": "desc"  # Most recent first
+                "limit": 1000,  # Limit to last 100 events
+                "sort": "desc",  # Most recent first
+
             }
-            
-            self.logger().info(f"Requesting order history with params: {history_params}")
+
+            # self.logger().info(f"Requesting order history with params: {history_params}")
 
             history_resp = await self._api_get(
                 path_url=CONSTANTS.HISTORY_ORDERS_ENDPOINT,
@@ -732,184 +834,61 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                 trading_pair=tracked_order.trading_pair
             )
 
-            # Check if we have a valid response
-            if not isinstance(history_resp, dict) or "elements" not in history_resp:
-                self.logger().error(f"Unexpected response format: {type(history_resp)}")
+            # self.logger().info(f"Raw history response: {history_resp}")
+
+            if not history_resp:
+                self.logger().warning(f"Empty response received for order history request")
                 return {"result": "success", "orders": []}
 
-            # Extract events from the response
-            events = history_resp.get("elements", [])
-            
-            if not events:
-                self.logger().info("No events found in response")
-                return {"result": "success", "orders": []}
+            if isinstance(history_resp, dict):
+                events = history_resp.get("elements", [])
+                # self.logger().info(f"Found {len(events)} events in history")
 
-            self.logger().info(f"\n=== Processing {len(events)} events ===")
-            self.logger().info(f"Looking for client order ID: {tracked_order.client_order_id}")
-            
-            # Filter and store matching events
-            matching_events = []
-            
-            for event_data in events:
-                event = event_data.get("event", {})
-                if not event:
-                    continue
-                    
-                # Extract the inner event type and data
-                event_type = next(iter(event)) if event else None
-                event_details = event.get(event_type, {}) if event_type else {}
-                
-                # Skip OrderNotFound events
-                if event_type == "OrderNotFound":
-                    continue
-                
-                # Extract order data based on event type
-                order_data = None
-                if event_type == "OrderPlaced":
-                    order_data = event_details.get("order", {})
-                elif event_type == "OrderUpdated":
-                    order_data = event_details.get("newOrder", {})
-                elif event_type == "OrderCancelled":
-                    order_data = event_details.get("order", {})
-                
-                if not order_data:
-                    continue
-                    
-                # Check if this event matches our order's client ID
-                client_id = order_data.get("clientId")
-                
-                self.logger().info(f"\nChecking event match:"
-                                 f"\n  Event Client ID: {client_id}"
-                                 f"\n  Our Client ID: {tracked_order.client_order_id}")
-                
-                if client_id == tracked_order.client_order_id:
-                    self.logger().info(f"Found matching event: {event_type}")
-                    matching_events.append((
-                        event_data.get("timestamp", 0),
-                        event_type,
-                        event_details,
-                        order_data
-                    ))
-            
-            # If we found matching events
-            if matching_events:
-                self.logger().info(f"\n=== Found {len(matching_events)} matching events ===")
-                # Sort events by timestamp (most recent first)
-                matching_events.sort(key=lambda x: x[0], reverse=True)
-                
-                # Get the most recent event
-                _, event_type, event_details, order_data = matching_events[0]
-                
-                self.logger().info(f"\nMost recent matching event:"
-                                 f"\n  Type: {event_type}"
-                                 f"\n  Details: {json.dumps(event_details, indent=2)}"
-                                 f"\n  Order Data: {json.dumps(order_data, indent=2)}")
-                
-                # Determine status based on event type and details
-                status = "OPEN"  # Default status
-                
-                if event_type == "OrderCancelled":
-                    status = "CANCELLED"
-                elif event_type == "OrderUpdated":
-                    reason = event_details.get("reason", "")
-                    if reason == "full_fill":
-                        status = "FILLED"
-                        # For filled orders, fetch and process the fills
-                        try:
-                            self.logger().info(f"Order is filled, fetching fill information...")
-                            fills_response = await self._request_order_fills(tracked_order)
-                            fills = fills_response.get("fills", [])
-                            if fills:
-                                self.logger().info(f"Found {len(fills)} fills for order {tracked_order.client_order_id}")
-                                # Process each fill
-                                for fill in fills:
-                                    self.logger().info(f"Processing fill: {fill}")
-                                    self._process_trade_event_message(fill)
-                            else:
-                                self.logger().warning(f"No fills found for filled order {tracked_order.client_order_id}")
-                        except Exception as e:
-                            self.logger().error(f"Error fetching fills for filled order: {str(e)}")
-                    elif reason in ["cancelled_by_user", "cancelled_by_system", "cancelled_by_trigger"]:
-                        status = "CANCELLED"
-                    elif Decimal(str(order_data.get("filled", "0"))) > Decimal("0"):
-                        status = "PARTIALLY_FILLED"
-                elif event_type == "OrderPlaced":
-                    if Decimal(str(order_data.get("filled", "0"))) > Decimal("0"):
-                        status = "PARTIALLY_FILLED"
-                
-                self.logger().info(f"\n=== Final Order Status ===\nStatus: {status}")
-                
-                return {
-                    "result": "success",
-                    "orders": [{
-                        "order": {
-                            "orderId": order_data.get("uid"),
-                            "cliOrdId": order_data.get("clientId"),
-                            "status": status
-                        }
-                    }]
-                }
-            
-            # If no matching events found
-            self.logger().info(f"\n=== No matching events found for order {tracked_order.client_order_id} ===")
+                # Format the response to match what the processor expects
+                formatted_orders = []
+
+                for event in events:
+                    event_data = event.get("event", {})
+                    if not event_data:
+                        continue
+
+                    event_type = next(iter(event_data)) if event_data else None
+                    if not event_type:
+                        continue
+
+                    event_details = event_data[event_type]
+                    order_data = None
+
+                    if event_type == "OrderCancelled":
+                        order_data = event_details.get("order", {})
+                        if order_data.get("clientId") == tracked_order.client_order_id:
+                            formatted_orders.append({
+                                "order": {
+                                    "orderId": order_data.get("uid"),
+                                    "cliOrdId": order_data.get("clientId"),
+                                    "status": "CANCELLED"
+                                }
+                            })
+                    elif event_type == "OrderUpdated":
+                        order_data = event_details.get("newOrder", {})
+                        if order_data.get("clientId") == tracked_order.client_order_id:
+                            reason = event_details.get("reason", "")
+                            status = "FILLED" if reason == "full_fill" else "PARTIALLY_FILLED"
+                            formatted_orders.append({
+                                "order": {
+                                    "orderId": order_data.get("uid"),
+                                    "cliOrdId": order_data.get("clientId"),
+                                    "status": status
+                                }
+                            })
+
+                return {"result": "success", "orders": formatted_orders}
+
             return {"result": "success", "orders": []}
 
         except Exception as e:
-            self.logger().error(f"Error fetching order history: {str(e)}")
-            if hasattr(e, 'response'):
-                response_text = await e.response.text()
-                self.logger().debug(f"Response text: {response_text}")
+            self.logger().error(f"Error requesting order history for {tracked_order.client_order_id}: {str(e)}", exc_info=True)
             return {"result": "success", "orders": []}
-        
-        finally:
-            # Log the current state of all tracked orders
-            self.logger().info("\n=== Current Order Tracker State ===")
-            
-            # Log active orders
-            active_orders = self._order_tracker.active_orders
-            self.logger().info(f"\nActive Orders ({len(active_orders)}):")
-            for order in active_orders.values():
-                self.logger().info(
-                    f"  - Order ID: {order.client_order_id}"
-                    f"\n    Exchange ID: {order.exchange_order_id}"
-                    f"\n    Trading Pair: {order.trading_pair}"
-                    f"\n    State: {order.current_state}"
-                    f"\n    Amount: {order.amount}"
-                    f"\n    Executed: {order.executed_amount_base}"
-                    f"\n    Price: {order.price}"
-                    f"\n    Type: {order.order_type}"
-                    f"\n    Is Done: {order.is_done}"
-                    f"\n    Is Cancelled: {order.is_cancelled}"
-                )
-            
-            # Log completed orders
-            completed_orders = [o for o in self._order_tracker.all_fillable_orders.values() if o.is_done]
-            self.logger().info(f"\nCompleted Orders ({len(completed_orders)}):")
-            for order in completed_orders:
-                self.logger().info(
-                    f"  - Order ID: {order.client_order_id}"
-                    f"\n    Exchange ID: {order.exchange_order_id}"
-                    f"\n    Trading Pair: {order.trading_pair}"
-                    f"\n    Final State: {order.current_state}"
-                    f"\n    Amount: {order.amount}"
-                    f"\n    Executed: {order.executed_amount_base}"
-                    f"\n    Price: {order.price}"
-                    f"\n    Type: {order.order_type}"
-                )
-            
-            # Log lost orders
-            lost_orders = self._order_tracker.lost_orders
-            self.logger().info(f"\nLost Orders ({len(lost_orders)}):")
-            for order in lost_orders.values():
-                self.logger().info(
-                    f"  - Order ID: {order.client_order_id}"
-                    f"\n    Exchange ID: {order.exchange_order_id}"
-                    f"\n    Trading Pair: {order.trading_pair}"
-                    f"\n    State: {order.current_state}"
-                    f"\n    Amount: {order.amount}"
-                    f"\n    Price: {order.price}"
-                    f"\n    Type: {order.order_type}"
-                )
 
     def clear_order_history_cache(self):
         """
@@ -918,8 +897,8 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         """
         self._order_history_cache = {}
         self._last_order_history_fetch_ts = 0
-        self.logger().info("Order history cache cleared")
-        
+        # self.logger().info("Order history cache cleared")
+
 
 
     async def _user_stream_event_listener(self):
@@ -935,30 +914,41 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             "account_log"
         }
         confirmed_feeds = set()
+        
+        self.logger().info("\n=== Starting User Stream Event Listener ===")
+        self.logger().info(f"Required feeds: {required_feeds}")
 
         async for event_message in self._iter_user_event_queue():
             try:
+                self.logger().debug(f"\nReceived user stream message: {event_message}")
+                
                 # Handle subscription messages
                 if event_message.get("event") == "subscribed":
                     feed = event_message.get("feed")
                     if feed:
-                        self.logger().debug(f"Successfully subscribed to {feed} feed")
                         confirmed_feeds.add(feed)
+                        self.logger().info(f"✓ Confirmed subscription to {feed}")
+                        self.logger().info(f"Subscribed feeds: {len(confirmed_feeds)}/{len(required_feeds)} - {sorted(confirmed_feeds)}")
+                        
                         # Check if all required feeds are confirmed
                         if confirmed_feeds.issuperset(required_feeds):
+                            self.logger().info("✓ All required feeds confirmed!")
                             self._user_stream_tracker.data_source._user_stream_event.set()
-                            self.logger().info("User stream initialized!")
                     continue
-                
+
                 # Process messages based on feed type
                 feed = event_message.get("feed")
                 if feed == "open_positions":
+                    self.logger().info("Processing position update")
                     await self._process_account_position_event(event_message)
                 elif feed == "open_orders_verbose":
+                    self.logger().info("Processing order update")
                     self._process_order_event_message(event_message)
                 elif feed == "fills":
+                    self.logger().info("Processing trade update")
                     self._process_trade_event_message(event_message)
                 elif feed == "balances":
+                    self.logger().info("Processing balance update")
                     self._process_wallet_event_message(event_message)
                 elif feed == "notifications_auth":
                     # Only log notifications that contain actual notifications
@@ -968,11 +958,12 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                 elif feed == "account_log":
                     self.logger().debug(f"Received account log: {event_message}")
                 else:
-                    self.logger().debug(f"Received message from unhandled feed: {feed}")
+                    self.logger().warning(f"Received message from unhandled feed: {feed}")
+                    self.logger().debug(f"Message content: {event_message}")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger().error(f"Unexpected error in user stream listener loop: {str(e)}")
+                self.logger().error(f"Unexpected error in user stream listener loop: {str(e)}", exc_info=True)
                 await self._sleep(5.0)
 
     async def _process_account_position_event(self, position_msg: Dict[str, Any]):
@@ -994,13 +985,13 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                     continue
 
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=ex_trading_pair)
-                
+
                 # For determining position side, check if pnl_currency exists and matches quote asset
                 base_asset, quote_asset = trading_pair.split("-")
                 position_side = PositionSide.LONG
                 if "pnl_currency" in position:
                     position_side = PositionSide.LONG if position["pnl_currency"] == quote_asset else PositionSide.SHORT
-                
+
                 amount = Decimal(str(position.get("balance", "0")))
                 pos_key = self._perpetual_trading.position_key(trading_pair, position_side)
 
@@ -1008,7 +999,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                     entry_price = Decimal(str(position.get("entry_price", "0")))
                     unrealized_pnl = Decimal(str(position.get("pnl", "0")))
                     leverage = Decimal(str(position.get("effective_leverage", "1")))
-                    
+
                     position_instance = Position(
                         trading_pair=trading_pair,
                         position_side=position_side,
@@ -1032,42 +1023,29 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         Updates in-flight order and triggers cancellation or failure event if needed.
         :param order_msg: The order event message payload
         """
-        # self.logger().info(f"\n=== Processing Order Event ===\nMessage: {order_msg}")
-        
+        self.logger().debug(f"Processing order event: {order_msg}")
+
         # Check if this is a historical order update
         if isinstance(order_msg, dict) and "order" in order_msg and isinstance(order_msg["order"], dict) and "order" in order_msg["order"]:
-            # self.logger().info("Detected historical order update - forwarding to historical processor")
+            self.logger().debug("Processing historical order update")
             return self._process_historical_order_event_message(order_msg["order"])
 
         # Handle live order updates
         if "order" not in order_msg:
-            # self.logger().info("No order data in message")
+            self.logger().debug("No order data in message")
             return
 
         order_data = order_msg.get("order", {})
         client_order_id = str(order_data.get("cliOrdId", ""))
-        
+
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is None:
-            # Check if this is a lost order before logging not found
-            lost_order = self._order_tracker.lost_orders.get(client_order_id)
-            if lost_order is not None:
-                # self.logger().info(f"Order {client_order_id} was previously marked as lost - Updating final state")
-                pass
-            else:
-                # self.logger().info(f"Order {client_order_id} not found in order tracker")
-                # self.logger().debug(f"Current orders in tracker: {self._order_tracker.all_updatable_orders}")
-                pass
+            self.logger().debug(f"Order not found in tracker: {client_order_id}")
             return
 
         # Get order status
         order_status = order_data.get("status", "UNKNOWN")
-        # self.logger().info(f"\nOrder Details:"
-        #                   f"\n  - Client Order ID: {client_order_id}"
-        #                   f"\n  - Current State: {tracked_order.current_state}"
-        #                   f"\n  - New Status: {order_status}"
-        #                   f"\n  - Is Done: {tracked_order.is_done}"
-        #                   f"\n  - Is Cancelled: {tracked_order.is_cancelled}")
+        self.logger().debug(f"Order status update - ID: {client_order_id}, Current Status: {tracked_order.current_state}, New Status: {order_status}")
 
         # Get exchange order ID
         exchange_order_id = str(order_data.get("orderId", ""))
@@ -1083,95 +1061,111 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             new_state=CONSTANTS.ORDER_STATE[order_status],
         )
 
-        # self.logger().info(f"\nCreated Order Update:"
-        #                   f"\n  - New State: {CONSTANTS.ORDER_STATE[order_status]}"
-        #                   f"\n  - Timestamp: {timestamp}")
+        self.logger().debug(
+            f"Creating order update:"
+            f"\n  Client Order ID: {client_order_id}"
+            f"\n  Exchange Order ID: {exchange_order_id}"
+            f"\n  Status: {order_status}"
+            f"\n  New State: {CONSTANTS.ORDER_STATE[order_status]}"
+        )
 
         self._order_tracker.process_order_update(order_update)
 
-        # self.logger().info(f"\nOrder State After Update:"
-        #                   f"\n  - New State: {tracked_order.current_state}"
-        #                   f"\n  - Is Done: {tracked_order.is_done}"
-        #                   f"\n  - Is Filled: {tracked_order.is_filled}"
-        #                   f"\n  - Is Cancelled: {tracked_order.is_cancelled}"
-        #                   f"\n  - Final Fills: {tracked_order.executed_amount_base}")
+        self.logger().debug(
+            f"Order state after update:"
+            f"\n  New State: {tracked_order.current_state}"
+            f"\n  Is Done: {tracked_order.is_done}"
+            f"\n  Is Filled: {tracked_order.is_filled}"
+            f"\n  Is Cancelled: {tracked_order.is_cancelled}"
+        )
 
     def _process_historical_order_event_message(self, order_msg: Dict[str, Any]):
         """
-        Process order updates from the order history endpoint.
-        This is only called as a fallback when an order is not found in active orders.
+        Updates in-flight order and triggers order update event for order message received through the history API.
+        :param order_msg: The order event message payload
         """
-        # self.logger().info(f"\n=== Processing Historical Order Event (Fallback) ===\nMessage: {order_msg}")
-        
-        # Extract order data (keeping existing logic since message format is different)
+        # self.logger().info(f"\n=== Processing Historical Order Event ===\nMessage: {order_msg}")
+
+        # Extract order data and event type
         order_data = None
-        if isinstance(order_msg, dict):
-            if "order" in order_msg and isinstance(order_msg["order"], dict):
-                if "order" in order_msg["order"]:
-                    order_data = order_msg["order"]["order"]
-                else:
-                    order_data = order_msg["order"]
+        event_type = None
+        order_update_reason = None
+
+        # Handle the case where we receive the event structure directly
+        if "event" in order_msg:
+            event = order_msg["event"]
+            event_type = next(iter(event)) if event else None
+            if event_type == "OrderCancelled":
+                order_data = event[event_type].get("order", {})
+                order_update_reason = "cancelled_by_user"
+            elif event_type == "OrderUpdated":
+                order_data = event[event_type].get("newOrder", {})
+                order_update_reason = event[event_type].get("reason", "")
+            elif event_type == "OrderPlaced":
+                order_data = event[event_type].get("order", {})
+                order_update_reason = "placed"
+        else:
+            # Handle the case where we receive the order data directly
+            if isinstance(order_msg.get("order"), dict) and isinstance(order_msg["order"].get("order"), dict):
+                # Handle double-nested structure
+                order_data = order_msg["order"]["order"]
             else:
-                order_data = order_msg
+                # Handle single-nested structure
+                order_data = order_msg.get("order", {})
 
         if not order_data:
-            self.logger().error(f"Could not extract order data from historical message")
+            self.logger().error(f"No order data found in message: {order_msg}")
             return
 
-        # Get client order ID
-        client_order_id = str(order_data.get("cliOrdId") or order_data.get("clientId", ""))
+        # Extract client order ID from the order data
+        client_order_id = order_data.get("cliOrdId")
+
         if not client_order_id:
-            self.logger().error("No client order ID found in historical order data")
-            return
-        
-        # Find the tracked order
-        tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-        if tracked_order is None:
-            # self.logger().info(f"Order {client_order_id} not found in order tracker")
+            self.logger().error(f"No client order ID found in order data structure: {order_data}")
             return
 
-        # Get exchange order ID and status
-        exchange_order_id = str(order_data.get("orderId") or order_data.get("uid", ""))
-        order_status = order_data.get("status", "UNKNOWN")
+        tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+        if not tracked_order:
+            self.logger().debug(f"Order {client_order_id} not found in order tracker")
+            return
+
+        exchange_order_id = order_data.get("orderId") or order_data.get("uid", "")
         timestamp = self.current_timestamp
 
-        # self.logger().info(f"\nProcessing Historical Order Update:"
-        #                   f"\n  Client Order ID: {client_order_id}"
-        #                   f"\n  Current State: {tracked_order.current_state}"
-        #                   f"\n  New Status: {order_status}")
+        # Map the order status and check fills
+        order_status = order_data.get("status", "UNKNOWN")
+        filled_amount = Decimal(str(order_data.get("filled", "0")))
+        total_amount = Decimal(str(order_data.get("size", "0")))
 
-        try:
-            # Don't update the state if the order is already filled
-            if tracked_order.is_filled and tracked_order.is_done:
-                # self.logger().info(f"Order {client_order_id} is already filled, skipping state update")
-                return
+        # Determine the new state based on status and fills
+        if order_status == "CANCELLED":
+            new_state = CONSTANTS.ORDER_STATE["CANCELLED"]
+        elif filled_amount >= total_amount and total_amount > 0:
+            new_state = CONSTANTS.ORDER_STATE["FILLED"]
+        elif filled_amount > 0:
+            new_state = CONSTANTS.ORDER_STATE["PARTIALLY_FILLED"]
+        elif order_status == "FILLED":
+            new_state = CONSTANTS.ORDER_STATE["FILLED"]
+        else:
+            new_state = CONSTANTS.ORDER_STATE.get(order_status, CONSTANTS.ORDER_STATE["UNKNOWN"])
 
-            # Create order update using the CONSTANTS.ORDER_STATE mapping
-            order_update = OrderUpdate(
-                client_order_id=client_order_id,
-                exchange_order_id=exchange_order_id,
-                trading_pair=tracked_order.trading_pair,
-                update_timestamp=timestamp,
-                new_state=CONSTANTS.ORDER_STATE[order_status],
-            )
+        self.logger().info(f"\nCreating order update:"
+                          f"\n  Client Order ID: {client_order_id}"
+                          f"\n  Exchange Order ID: {exchange_order_id}"
+                          f"\n  Status: {order_status}"
+                          f"\n  Filled Amount: {filled_amount}/{total_amount}"
+                          f"\n  New State: {new_state}")
 
-            # self.logger().info(f"\nCreated Historical Order Update:"
-            #                   f"\n  New State: {CONSTANTS.ORDER_STATE[order_status]}"
-            #                   f"\n  Timestamp: {timestamp}")
+        order_update = OrderUpdate(
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=timestamp,
+            new_state=new_state,
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_order_id,
+        )
 
-            self._order_tracker.process_order_update(order_update)
-
-            # self.logger().info(f"\nOrder State After Historical Update:"
-            #                   f"\n  New State: {tracked_order.current_state}"
-            #                   f"\n  Is Done: {tracked_order.is_done}"
-            #                   f"\n  Is Filled: {tracked_order.is_filled}"
-            #                   f"\n  Is Cancelled: {tracked_order.is_cancelled}"
-            #                   f"\n  Final Fills: {tracked_order.executed_amount_base}")
-
-        except KeyError as e:
-            self.logger().error(f"Invalid order status received: {order_status}. Error: {str(e)}")
-        except Exception as e:
-            self.logger().error(f"Error processing historical order update: {str(e)}")
+        self._order_tracker.process_order_update(order_update)
+# // ... existing code ...
 
     def _process_trade_event_message(self, trade_msg: Dict[str, Any]):
         """
@@ -1314,15 +1308,15 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             # Get quantity and collateral value
             quantity = details.get("quantity", 0)
             collateral_value = details.get("collateral_value", 0)
-            
+
             # Convert values to Decimal
             available_balance = Decimal(str(quantity))
             total_balance = Decimal(str(quantity))
-            
+
             # Update balance for this currency
             self._account_balances[currency] = total_balance
             self._account_available_balances[currency] = available_balance
-            
+
             self.logger().debug(f"Updated {currency} balance - Total: {total_balance}, Available: {available_balance}")
 
         # Log portfolio summary
@@ -1470,7 +1464,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                 if base == "XBT":
                     base = "BTC"
 
-                trading_pair = f"{base}-{quote}"
+                trading_pair = combine_to_hb_trading_pair(base, quote)
                 mapping[exchange_symbol] = trading_pair
 
             self._set_trading_pair_symbol_map(mapping)
@@ -1496,7 +1490,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().error(f"Could not resolve the exchange symbols {new_exchange_symbol} and {current_exchange_symbol}")
             mapping.pop(current_exchange_symbol)
 
-        self.logger().info(f"Could not resolve the exchange symbols {new_exchange_symbol} and {current_exchange_symbol}")
+        # self.logger().info(f"Could not resolve the exchange symbols {new_exchange_symbol} and {current_exchange_symbol}")
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
@@ -1618,7 +1612,6 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         """
         if trade_type not in [TradeType.BUY, TradeType.SELL]:
             raise NotImplementedError(f"Unsupported trade type {trade_type}")
-        if position_action not in [PositionAction.OPEN, PositionAction.CLOSE]:
             raise NotImplementedError(f"Unsupported position action {position_action}")
         return 0  # Kraken only supports one-way positions
 
@@ -1805,7 +1798,8 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         # self.logger().info(f"\nOverall connector ready: {is_ready}")
         if not is_ready:
             not_ready = [k for k, v in status_d.items() if not v]
-            self.logger().info(f"Waiting for: {', '.join(not_ready)}")
+            # self.logger().info(f"Waiting for: {', '.join(not_ready)}")
 
         return status_d
+
 

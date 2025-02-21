@@ -256,6 +256,7 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     async def listen_for_subscriptions(self):
         """Subscribe to the order book, trade, and funding info channels."""
         try:
+            self.logger().info("\n==== Starting WebSocket Subscription Process ====")
             self.logger().info("Waiting for trading pair mapping and funding info to be initialized...")
             await asyncio.wait([self._mapping_initialized.wait(), self._funding_info_initialized.wait()], timeout=30.0)
             
@@ -264,37 +265,78 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             if not self._funding_info_initialized.is_set():
                 self.logger().warning("Funding info not initialized after timeout")
 
+            self.logger().info("Creating WebSocket connection...")
             ws = await self._api_factory.get_ws_assistant()
             await ws.connect(ws_url=self._ws_url)
-            self.logger().info("Sent subscription messages for order book, trade, ticker and heartbeat channels...")
+            self.logger().info("✓ WebSocket connection established")
 
             await self._subscribe_to_channels(ws, self._trading_pairs)
+            self.logger().info("\n==== Starting Message Processing Loop ====")
+
+            # Track subscription states
+            subscribed_feeds = set()
+            expected_feeds = set(self._subscriptions)
 
             # Process incoming messages
             async for msg in ws.iter_messages():
                 try:
+                    self.logger().debug(f"Raw message received: {msg}")
+                    
                     if isinstance(msg.data, bytes):
                         msg_data = msg.data.decode('utf-8')
+                        self.logger().debug("Decoded bytes message to string")
                     else:
                         msg_data = msg.data
+                        
+                    self.logger().debug(f"Processing message data: {msg_data}")
+                    
                     msg_json = json.loads(msg_data) if isinstance(msg_data, str) else msg_data
+                    self.logger().debug(f"Parsed message: {msg_json}")
+                    
+                    # Handle subscription confirmations
                     if msg_json.get("event") == "subscribed":
+                        feed = msg_json.get("feed")
+                        subscribed_feeds.add(feed)
+                        self.logger().info(f"✓ Received subscription confirmation for {feed}")
+                        self.logger().info(f"Subscribed feeds: {len(subscribed_feeds)}/{len(expected_feeds)} - {sorted(subscribed_feeds)}")
                         continue
+                    elif msg_json.get("event") == "error":
+                        self.logger().error(f"Subscription error: {msg_json}")
+                        continue
+                    
+                    # Log message details based on feed type
+                    feed = msg_json.get("feed")
+                    if feed == CONSTANTS.WS_ORDER_BOOK_EVENTS_TOPIC:
+                        self.logger().info(f"Order book message received - Type: {'snapshot' if 'bids' in msg_json else 'delta'}")
+                        self.logger().debug(f"Order book message content: {msg_json}")
+                    elif feed == CONSTANTS.WS_TRADES_TOPIC:
+                        self.logger().info("Trade message received")
+                        self.logger().debug(f"Trade message content: {msg_json}")
+                    elif feed == CONSTANTS.WS_INSTRUMENTS_INFO_TOPIC:
+                        self.logger().info("Instrument info message received")
+                        self.logger().debug(f"Instrument info content: {msg_json}")
+                    elif feed == "heartbeat":
+                        self.logger().debug("Heartbeat received")
+                    else:
+                        self.logger().info(f"Message received from feed: {feed}")
+                        self.logger().debug(f"Message content: {msg_json}")
+                    
+                    self.logger().debug("Passing message to _process_message")
                     await self._process_message(msg_json, self._message_queue)
-                except Exception:
+                    self.logger().debug("Message processing complete")
+                    
+                except Exception as e:
                     self.logger().error(
-                        "Unexpected error occurred when listening to order book streams "
-                        f"{self._ws_url}. Retrying in 5.0 seconds...",
+                        f"Error processing message: {str(e)}",
                         exc_info=True
                     )
-                    await self._sleep(5.0)
-
+                    
         except asyncio.CancelledError:
+            self.logger().info("WebSocket subscription task cancelled")
             raise
-        except Exception:
+        except Exception as e:
             self.logger().error(
-                f"Unexpected error occurred when listening to order book streams {self._ws_url}. "
-                "Retrying in 5.0 seconds...",
+                f"Unexpected error in WebSocket subscription loop: {str(e)}",
                 exc_info=True
             )
             await self._sleep(5.0)
@@ -308,7 +350,7 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         return ws
 
     async def _subscribe_to_channels(self, ws: WSAssistant, trading_pairs: List[str]):
-        """Subscribe to all public channels."""
+        """Subscribe to all public WebSocket channels."""
         try:
             self.logger().info("\n=== Subscribing to public WebSocket channels ===")
             
@@ -319,7 +361,7 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             self.logger().info(f"Converting trading pairs to symbols:")
             for tp, symbol in zip(trading_pairs, symbols):
                 self.logger().info(f"{tp} -> {symbol}")
-
+            
             # Define all feeds we want to subscribe to
             self._subscriptions = [
                 CONSTANTS.WS_ORDER_BOOK_EVENTS_TOPIC,
@@ -328,7 +370,7 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 CONSTANTS.WS_INSTRUMENTS_INFO_LITE_TOPIC,
                 CONSTANTS.WS_HEARTBEAT_TOPIC,
             ]
-
+            
             # Subscribe to all feeds
             for feed in self._subscriptions:
                 try:
@@ -340,43 +382,16 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                     # Add product_ids for all feeds except heartbeat
                     if feed != CONSTANTS.WS_HEARTBEAT_TOPIC:
                         payload["product_ids"] = symbols
-
+                    
                     self.logger().info(f"Sending subscription request for {feed}: {payload}")
                     subscribe_request = WSJSONRequest(payload=payload, is_auth_required=False)
                     await ws.send(subscribe_request)
                     self.logger().info(f"✓ Subscription request sent for {feed}")
                 except Exception as e:
                     self.logger().error(f"Error subscribing to {feed}: {str(e)}", exc_info=True)
-
+            
             self.logger().info("Subscription requests sent for all public channels")
             
-            # Wait for and verify subscription confirmations
-            subscription_timeout = 30  # 30 seconds timeout
-            start_time = time.time()
-            subscribed_feeds = set()
-            
-            while time.time() - start_time < subscription_timeout and len(subscribed_feeds) < len(self._subscriptions):
-                try:
-                    response = await asyncio.wait_for(ws.receive(), timeout=5.0)
-                    msg_data = response.data
-                    
-                    if msg_data.get("event") == "subscribed":
-                        feed = msg_data.get("feed")
-                        subscribed_feeds.add(feed)
-                        self.logger().info(f"✓ Confirmed subscription to {feed}")
-                    elif msg_data.get("event") == "error":
-                        self.logger().error(f"Subscription error: {msg_data}")
-                        
-                except asyncio.TimeoutError:
-                    self.logger().warning("Timeout waiting for subscription confirmation")
-                    break
-                    
-            if len(subscribed_feeds) < len(self._subscriptions):
-                missing_feeds = set(self._subscriptions) - subscribed_feeds
-                self.logger().warning(f"Not all feeds confirmed. Missing: {missing_feeds}")
-            else:
-                self.logger().info("✓ All feed subscriptions confirmed")
-
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -443,45 +458,192 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         elif event == "error":
             self.logger().error(f"Error in {feed} subscription: {message.get('message', '')}")
 
+    async def _process_message(self, msg: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Processes received WebSocket messages and routes them to appropriate handling methods.
+        :param msg: The received message in dictionary format
+        :param message_queue: The queue to put processed messages into
+        """
+        try:
+            feed = msg.get("feed")
+            self.logger().debug(f"Processing message from feed: {feed}")
+            
+            if feed in [CONSTANTS.WS_ORDER_BOOK_EVENTS_TOPIC, "book_snapshot", "book"]:
+                # Process order book messages
+                if feed == "book_snapshot" or "bids" in msg or "asks" in msg:
+                    self.logger().info(f"Processing order book snapshot for {msg.get('product_id')}")
+                    await self._process_order_book_message(msg)
+                else:
+                    self.logger().info(f"Processing order book delta for {msg.get('product_id')}")
+                    await self._process_order_book_message(msg)
+                    
+            elif feed == CONSTANTS.WS_TRADES_TOPIC:
+                # Process trade messages
+                self.logger().info(f"Processing trade message for {msg.get('product_id')}")
+                await self._process_trade_message(msg)
+                
+            elif feed == CONSTANTS.WS_INSTRUMENTS_INFO_TOPIC:
+                # Process funding info messages
+                self.logger().info(f"Processing funding info for {msg.get('product_id')}")
+                await self._parse_funding_info_message(msg, message_queue)
+                
+            elif feed == "heartbeat":
+                # Process heartbeat - already handled in main loop
+                self.logger().debug("Received heartbeat")
+                pass
+                
+            else:
+                self.logger().warning(f"Received message from unhandled feed: {feed}")
+                self.logger().debug(f"Message content: {msg}")
+                
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().error(f"Error processing message from feed {feed}: {str(e)}", exc_info=True)
+            self.logger().error(f"Message content: {msg}")
+            raise
+
     async def _process_order_book_message(self, message: Dict[str, Any]):
         """Process order book update and snapshot messages."""
-        self.logger().debug(f"\n=== Processing order book message: {message}")
-        
-        symbol = message.get("product_id", "")
-        trading_pair = utils.convert_from_exchange_trading_pair(symbol)
-        timestamp = message.get("timestamp", int(time.time() * 1e3))  # Default to current time in milliseconds
+        try:
+            symbol = message.get("product_id", "")
+            trading_pair = utils.convert_from_exchange_trading_pair(symbol)
+            timestamp = message.get("timestamp", int(time.time() * 1e3))  # Default to current time in milliseconds
+            sequence_number = message.get("seq", int(time.time() * 1e3))
 
-        # Handle order book snapshot
-        if message.get("feed") == "book_snapshot":
-            self.logger().debug("Processing book snapshot message")
-            snapshot_msg = self._convert_snapshot_message_to_order_book_row(
-                snapshot=message,
-                trading_pair=trading_pair,
-                sequence_number=message.get("seq", int(time.time() * 1e3)),
-                timestamp=timestamp
-            )
-            self.logger().debug(f"Created snapshot message: {snapshot_msg}")
-            await self._order_book_snapshot_queues[trading_pair].put(snapshot_msg)
-        # Handle order book update
-        else:
-            self.logger().debug("Processing book update message")
-            diff_msg = self._convert_diff_message_to_order_book_row(
-                message=message,
-                timestamp=timestamp
-            )
-            self.logger().debug(f"Created diff message: {diff_msg}")
-            await self._order_book_diff_queues[trading_pair].put(diff_msg)
+            self.logger().debug(f"\n=== Processing Order Book Message ===\n"
+                              f"Feed Type: {message.get('feed')}\n"
+                              f"Trading Pair: {trading_pair}\n"
+                              f"Sequence: {sequence_number}\n"
+                              f"Raw Message: {message}")
+
+            # Handle order book snapshot
+            if message.get("feed") == "book_snapshot" or ("bids" in message and "asks" in message):
+                self.logger().debug(f"Processing snapshot message for {trading_pair}")
+                
+                # Convert bids and asks to the expected format
+                bids, asks = self._get_bids_and_asks_from_ws_msg_data(message)
+                
+                snapshot_msg = OrderBookMessage(
+                    message_type=OrderBookMessageType.SNAPSHOT,
+                    content={
+                        "trading_pair": trading_pair,
+                        "update_id": sequence_number,
+                        "bids": bids,
+                        "asks": asks,
+                    },
+                    timestamp=timestamp * 1e-3  # Convert to seconds
+                )
+                
+                self.logger().info(f"Created snapshot for {trading_pair}:"
+                                 f"\n  Timestamp: {snapshot_msg.timestamp}"
+                                 f"\n  Sequence: {sequence_number}"
+                                 f"\n  # of Bids: {len(bids)}"
+                                 f"\n  # of Asks: {len(asks)}"
+                                 f"\n  First Bid: {bids[0] if bids else 'None'}"
+                                 f"\n  First Ask: {asks[0] if asks else 'None'}")
+                
+                await self._order_book_snapshot_queues[trading_pair].put(snapshot_msg)
+                self.logger().debug(f"Queued snapshot message for {trading_pair}")
+                
+            # Handle order book delta
+            else:
+                side = message.get("side", "").lower()
+                price = float(message.get("price", 0))
+                quantity = float(message.get("qty", 0))
+                
+                self.logger().debug(f"\n=== Processing Delta Message ===\n"
+                                  f"Trading Pair: {trading_pair}\n"
+                                  f"Side: {side}\n"
+                                  f"Price: {price}\n"
+                                  f"Quantity: {quantity}\n"
+                                  f"Action: {'Remove' if quantity == 0 else 'Update'}")
+                
+                # For deletions (qty = 0), we need to send a diff message that will remove the price level
+                # The order book tracker will handle qty = 0 by removing the price level
+                bids = [[price, quantity]] if side == "buy" else []
+                asks = [[price, quantity]] if side == "sell" else []
+                
+                diff_msg = OrderBookMessage(
+                    message_type=OrderBookMessageType.DIFF,
+                    content={
+                        "trading_pair": trading_pair,
+                        "update_id": sequence_number,
+                        "bids": bids,
+                        "asks": asks,
+                    },
+                    timestamp=timestamp * 1e-3  # Convert to seconds
+                )
+                
+                self.logger().info(f"Created delta for {trading_pair}:"
+                                 f"\n  Timestamp: {diff_msg.timestamp}"
+                                 f"\n  Sequence: {sequence_number}"
+                                 f"\n  Side: {side.upper()}"
+                                 f"\n  Price: {price}"
+                                 f"\n  Quantity: {quantity}"
+                                 f"\n  Action: {'Remove' if quantity == 0 else 'Update'}"
+                                 f"\n  Message Type: {diff_msg.type}")
+                
+                await self._order_book_diff_queues[trading_pair].put(diff_msg)
+                self.logger().debug(f"Queued delta message for {trading_pair}")
+                
+        except Exception as e:
+            self.logger().error(f"Error processing order book message: {str(e)}", exc_info=True)
+            self.logger().error(f"Message: {message}")
+            raise
 
     async def _process_trade_message(self, message: Dict[str, Any]):
         """Process trade messages."""
         try:
-            trade_msg = self._convert_trade_message_to_order_book_row(message)
-            if isinstance(trade_msg, OrderBookMessage):  # Check if it's already an OrderBookMessage
-                await self._message_queue[self._trade_messages_queue_key].put(trade_msg)
-            else:
-                self.logger().error(f"Unexpected trade message format: {trade_msg}")
+            # Handle string messages by attempting to parse them as JSON
+            if isinstance(message, str):
+                try:
+                    message = json.loads(message)
+                except json.JSONDecodeError:
+                    self.logger().error(f"Failed to parse trade message as JSON: {message}")
+                    return
+
+            # Validate message type
+            if not isinstance(message, (dict, OrderBookMessage)):
+                self.logger().error(f"Received invalid message type: {type(message)}")
+                return
+
+            # Handle pre-formatted OrderBookMessage
+            if isinstance(message, OrderBookMessage):
+                await self._message_queue[self._trade_messages_queue_key].put(message)
+                return
+
+            # Process dictionary message
+            if message.get("event") == "subscribed":
+                return
+
+            # Validate feed type
+            feed = message.get("feed")
+            if not feed:
+                self.logger().error(f"Message missing feed field: {message}")
+                return
+            if feed != CONSTANTS.WS_TRADES_TOPIC:
+                return  # Skip non-trade messages
+
+            # Validate required fields
+            required_fields = ["product_id", "price", "qty", "side", "seq"]
+            missing_fields = [field for field in required_fields if field not in message]
+            if missing_fields:
+                self.logger().error(f"Message missing required fields {missing_fields}: {message}")
+                return
+
+            # Convert message to order book row format
+            msg = self._convert_trade_message_to_order_book_row(message)
+            await self._message_queue[self._trade_messages_queue_key].put(msg)
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            self.logger().error(f"Error processing trade message: {str(e)}", exc_info=True)
+            self.logger().error(
+                f"Unexpected error when processing public trade updates from exchange: {str(e)}",
+                exc_info=True
+            )
+            await self._sleep(5.0)
 
     async def _process_ticker_message(self, message: Dict[str, Any]):
         """Process ticker messages."""
@@ -723,8 +885,8 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                         trading_pair=trading_pair,
                         index_price=Decimal(str(message["index"])),
                         mark_price=Decimal(str(message.get("markPrice", "0"))),
-                        next_funding_utc_timestamp=int(message.get("next_funding_rate_time", 0)),
                         rate=Decimal(str(message.get("funding_rate", "0"))),
+                        next_funding_utc_timestamp=int(message.get("next_funding_rate_time", 0)),
                     )
                     await output.put(funding_info)
                 except (KeyError, ValueError, TypeError) as e:
@@ -747,77 +909,259 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         while True:
             try:
                 message = await message_queue.get()
-                if message.get("feed") == CONSTANTS.WS_ORDER_BOOK_EVENTS_TOPIC:
-                    try:
-                        await self._parse_order_book_diff_message(
-                            raw_message=message,
-                            message_queue=output
-                        )
-                    except Exception:
-                        self.logger().error(
-                            "Unexpected error when processing public order book updates from exchange",
-                            exc_info=True
-                        )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().error(
-                    "Unexpected error when processing public order book updates from exchange",
-                    exc_info=True
-                )
-                await self._sleep(5.0)
-
-    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """Listen for trades."""
-        message_queue = self._message_queue[self._trade_messages_queue_key]
-        while True:
-            try:
-                message = await message_queue.get()
-
-                # Handle string messages by attempting to parse them as JSON
-                if isinstance(message, str):
-                    try:
-                        message = json.loads(message)
-                    except json.JSONDecodeError:
-                        self.logger().error(f"Failed to parse trade message as JSON: {message}")
-                        continue
-
-                # Validate message is a dict
-                if not isinstance(message, dict):
-                    self.logger().error(f"Received non-dict message: {message}")
-                    continue
-
-                # Skip subscription confirmation messages
-                if message.get("event") == "subscribed":
-                    continue
-
-                # Validate feed type
                 feed = message.get("feed")
-                if not feed:
-                    self.logger().error(f"Message missing feed field: {message}")
-                    continue
-                if feed != CONSTANTS.WS_TRADES_TOPIC:
-                    continue  # Skip non-trade messages
-
-                # Validate required fields
-                required_fields = ["product_id", "price", "qty", "side", "seq"]
-                missing_fields = [field for field in required_fields if field not in message]
-                if missing_fields:
-                    self.logger().error(f"Message missing required fields {missing_fields}: {message}")
-                    continue
-
-                # Convert message to order book row format
-                msg = self._convert_trade_message_to_order_book_row(message)
-                await output.put(msg)
-
+                
+                self.logger().debug(f"\n=== Order Book Diff Listener ===\n"
+                                  f"Received message from feed: {feed}\n"
+                                  f"Message: {message}")
+                
+                if feed in ["book", "book_snapshot"]:
+                    # Extract message details for logging
+                    side = message.get("side", "unknown")
+                    price = message.get("price", "unknown")
+                    qty = message.get("qty", "unknown")
+                    seq = message.get("seq", "unknown")
+                    product_id = message.get("product_id", "unknown")
+                    
+                    self.logger().debug(f"Processing order book update:"
+                                      f"\n  Product: {product_id}"
+                                      f"\n  Side: {side}"
+                                      f"\n  Price: {price}"
+                                      f"\n  Quantity: {qty}"
+                                      f"\n  Sequence: {seq}"
+                                      f"\n  Action: {'Remove' if float(qty or 0) == 0 else 'Update'}")
+                    
+                    try:
+                        # Process the message and create an OrderBookMessage
+                        order_msg = await self._process_order_book_message(message)
+                        
+                        # Queue the message for the order book tracker
+                        await output.put(order_msg)
+                        
+                        self.logger().debug(f"Successfully processed and queued order book update:"
+                                          f"\n  Message Type: {order_msg.type}"
+                                          f"\n  Trading Pair: {order_msg.trading_pair}"
+                                          f"\n  Update ID: {order_msg.update_id}")
+                        
+                    except Exception as e:
+                        self.logger().error(f"Error processing order book update: {str(e)}", exc_info=True)
+                else:
+                    self.logger().debug(f"Ignoring message with feed: {feed}")
+                
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger().error(
-                    f"Unexpected error when processing public trade updates from exchange: {str(e)}",
-                    exc_info=True
-                )
+                self.logger().error(f"Unexpected error in order book listener: {str(e)}", exc_info=True)
                 await self._sleep(5.0)
+
+    def _get_bids_and_asks_from_ws_msg_data(
+        self,
+        message: Dict[str, Any]
+    ) -> Tuple[List[List[float]], List[List[float]]]:
+        """Extract bids and asks from WebSocket message."""
+        bids = []
+        asks = []
+        
+        self.logger().debug(f"\n=== Processing Bids and Asks ===\n"
+                           f"Message: {message}")
+        
+        if "bids" in message:
+            for bid in message["bids"]:
+                price = float(bid["price"])
+                qty = float(bid["qty"])
+                bids.append([price, qty])
+                self.logger().debug(f"Added bid: Price={price}, Quantity={qty}")
+        
+        if "asks" in message:
+            for ask in message["asks"]:
+                price = float(ask["price"])
+                qty = float(ask["qty"])
+                asks.append([price, qty])
+                self.logger().debug(f"Added ask: Price={price}, Quantity={qty}")
+        
+        self.logger().debug(f"Processed bids and asks:"
+                           f"\n  Number of bids: {len(bids)}"
+                           f"\n  Number of asks: {len(asks)}"
+                           f"\n  First bid: {bids[0] if bids else 'None'}"
+                           f"\n  First ask: {asks[0] if asks else 'None'}")
+        
+        return bids, asks
+
+    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """Parse order book diff message and put it to the queue."""
+        try:
+            if "timestamp" not in raw_message:
+                raise ValueError("Incomplete message - missing timestamp")
+
+            exchange_trading_pair = raw_message["product_id"]  # Get exchange format
+            timestamp = raw_message.get("timestamp", int(time.time()))
+            update_id = raw_message.get("seq", timestamp)
+
+            # Handle snapshot message
+            if (raw_message.get("feed") == CONSTANTS.WS_ORDER_BOOK_EVENTS_TOPIC or raw_message.get("feed") == "book_snapshot") and "bids" in raw_message and "asks" in raw_message:
+                self.logger().info(f"Processing full order book for {exchange_trading_pair}")
+                bids, asks = self._get_bids_and_asks_from_ws_msg_data(raw_message)
+                self.logger().info(f"Order book contains {len(bids)} bids and {len(asks)} asks")
+                
+                order_book_message_content = {
+                    "trading_pair": exchange_trading_pair,  # Keep exchange format for snapshots
+                    "update_id": update_id,
+                    "bids": bids,
+                    "asks": asks
+                }
+                message = OrderBookMessage(
+                    message_type=OrderBookMessageType.SNAPSHOT,
+                    content=order_book_message_content,
+                    timestamp=timestamp
+                )
+                # Update sequence number and put message in queue
+                self._last_sequence_numbers[exchange_trading_pair] = update_id
+                await message_queue.put(message)
+                self.logger().info(f"✓ Processed full order book for {exchange_trading_pair} - Sequence: {update_id}")
+                return
+
+            # Check if mapping is ready using the event
+            if not self._mapping_initialized.is_set():
+                self.logger().debug(f"Trading pair mapping not ready yet, queuing message for {exchange_trading_pair}")
+                return
+
+            # Try to get trading pair from connector mapping
+            try:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(exchange_trading_pair)
+                self.logger().debug(f"Successfully converted {exchange_trading_pair} to {trading_pair}")
+            except KeyError:
+                self.logger().warning(f"Trading pair mapping not found for {exchange_trading_pair}, skipping message")
+                return
+            except Exception as e:
+                self.logger().error(f"Error converting trading pair {exchange_trading_pair}: {str(e)}")
+                return
+
+            # Skip out-of-order messages for diffs only
+            if trading_pair in self._last_sequence_numbers:
+                last_seq = self._last_sequence_numbers[trading_pair]
+                if update_id <= last_seq:
+                    self.logger().info(f"Skipping stale delta for {trading_pair} - Last seq: {last_seq}, Current seq: {update_id}")
+                    return
+                elif update_id != last_seq + 1:
+                    self.logger().warning(f"Gap detected for {trading_pair}: expected {last_seq+1} but got {update_id}. Triggering resync.")
+                    # Trigger resync: fetch a new snapshot and update the sequence number
+                    snapshot_msg = await self._order_book_snapshot(trading_pair)
+                    await message_queue.put(snapshot_msg)
+                    self._last_sequence_numbers[trading_pair] = snapshot_msg.content.get('update_id', update_id)
+                    return
+
+            # Handle diff message
+            bids = []
+            asks = []
+            side = raw_message.get("side", "unknown")
+            price = raw_message.get("price", "unknown")
+            qty = raw_message.get("qty", "unknown")
+            
+            if side == "buy":
+                bids.append([float(price), float(qty)])
+                self.logger().info(f"Processing BID delta for {trading_pair} - Price: {price}, Qty: {qty}")
+            elif side == "sell":
+                asks.append([float(price), float(qty)])
+                self.logger().info(f"Processing ASK delta for {trading_pair} - Price: {price}, Qty: {qty}")
+
+            order_book_message_content = {
+                "trading_pair": trading_pair,
+                "update_id": update_id,
+                "bids": bids,
+                "asks": asks
+            }
+            message = OrderBookMessage(
+                message_type=OrderBookMessageType.DIFF,
+                content=order_book_message_content,
+                timestamp=timestamp
+            )
+
+            # Update sequence number and put message in queue
+            self._last_sequence_numbers[trading_pair] = update_id
+            await message_queue.put(message)
+            self.logger().info(f"✓ Processed {side.upper()} delta for {trading_pair} - Sequence: {update_id}")
+        except Exception as e:
+            self.logger().error(
+                f"Error processing order book message: {raw_message}. Error: {str(e)}",
+                exc_info=True
+            )
+
+    async def _parse_trade_message(self, message: Dict[str, Any], message_queue: asyncio.Queue):
+        """Parse trade message and put it in the queue."""
+        if message.get("feed") != CONSTANTS.WS_TRADES_TOPIC:
+            return
+
+        exchange_trading_pair = message["product_id"]  # Get exchange format
+        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(exchange_trading_pair)  # Convert to connector format
+        timestamp = message["timestamp"] * 1e-3  # Convert to seconds
+        price = Decimal(str(message["price"]))
+        amount = Decimal(str(message["qty"]))
+        trade_type = TradeType.BUY if message.get("side", "").lower() == "buy" else TradeType.SELL
+
+        trade_msg = OrderBookMessage(
+            message_type=OrderBookMessageType.TRADE,
+            content={
+                "trading_pair": trading_pair,  # Using connector format
+                "trade_type": trade_type,
+                "trade_id": message.get("seq", int(timestamp * 1000)),
+                "update_id": message.get("seq", int(timestamp * 1000)),
+                "price": price,
+                "amount": amount,
+                "timestamp": timestamp
+            },
+            timestamp=timestamp
+        )
+
+        await message_queue.put(trade_msg)
+
+    async def _parse_funding_info_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Parses a funding info message from the WebSocket stream and puts it into the message queue.
+        :param raw_message: The raw message from the WebSocket
+        :param message_queue: The queue to put the parsed message into
+        """
+        if raw_message["feed"] == CONSTANTS.WS_INSTRUMENTS_INFO_TOPIC:
+            try:
+                # The product_id field contains the symbol
+                if "product_id" not in raw_message:
+                    self.logger().debug(f"No product_id in message: {raw_message}")
+                    return
+                
+                symbol = raw_message["product_id"]
+                
+                # Check if mapping is initialized
+                if not self._mapping_initialized.is_set():
+                    self.logger().debug(f"Trading pair mapping not ready yet, skipping funding info for {symbol}")
+                    return
+                
+                try:
+                    # Use the connector's trading pair mapping
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
+                except KeyError:
+                    self.logger().debug(f"No trading pair mapping found for {symbol}, waiting for mapping to be ready")
+                    return
+                
+                if not trading_pair:
+                    self.logger().debug(f"No trading pair mapping found for {symbol}")
+                    return
+                
+                self.logger().debug(f"Processing funding info for {symbol} -> {trading_pair}")
+                
+                # Extract required fields with proper error handling
+                try:
+                    info_update = FundingInfoUpdate(
+                        trading_pair=trading_pair,
+                        index_price=Decimal(str(raw_message.get("markPrice", "0"))),
+                        mark_price=Decimal(str(raw_message.get("markPrice", "0"))),
+                        next_funding_utc_timestamp=int(raw_message.get("next_funding_rate_time", time.time())),
+                        rate=Decimal(str(raw_message.get("fundingRate", "0"))))
+                    await message_queue.put(info_update)
+                except (KeyError, ValueError) as e:
+                    self.logger().debug(f"Error extracting funding info fields: {e} from message: {raw_message}")
+            except Exception as e:
+                self.logger().debug(f"Error processing funding info message for {raw_message.get('product_id', 'unknown symbol')}: {str(e)}")
+                if self.logger().getEffectiveLevel() <= logging.DEBUG:
+                    self.logger().debug("Full traceback:", exc_info=True)
 
     def _order_book_row_for_processing(self, message: OrderBookMessage) -> OrderBookMessage:
         """Convert OrderBookMessage to the format expected by the order book tracker."""
@@ -903,273 +1247,74 @@ class KrakenPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         
         return data
 
-    def _get_bids_and_asks_from_rest_msg_data(self, snapshot: Dict[str, Any]) -> Tuple[List[List[float]], List[List[float]]]:
+    def _get_bids_and_asks_from_rest_msg_data(
+        self,
+        snapshot: Dict[str, Any]
+    ) -> Tuple[List[List[float]], List[List[float]]]:
         """Extract bids and asks from REST snapshot message."""
         bids = []
         asks = []
-
-        if "bids" in snapshot:
-            bids = [[float(price), float(qty)] for price, qty in snapshot["bids"]]
-        if "asks" in snapshot:
-            asks = [[float(price), float(qty)] for price, qty in snapshot["asks"]]
-
+        for bid in snapshot.get("bids", []):
+            bids.append([float(bid[0]), float(bid[1])])
+        for ask in snapshot.get("asks", []):
+            asks.append([float(ask[0]), float(ask[1])])
         return bids, asks
 
-    def _get_bids_and_asks_from_ws_msg_data(self, message: Dict[str, Any]) -> Tuple[List[List[float]], List[List[float]]]:
-        """Extract bids and asks from WebSocket message."""
-        bids = []
-        asks = []
 
-        if "bids" in message:
-            bids = [[float(price), float(qty)] for price, qty in message["bids"] if float(qty) > 0]
-        if "asks" in message:
-            asks = [[float(price), float(qty)] for price, qty in message["asks"] if float(qty) > 0]
+    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """Listen for trades."""
+        message_queue = self._message_queue[self._trade_messages_queue_key]
+        while True:
+            try:
+                message = await message_queue.get()
 
-        return bids, asks
+                # If message is already an OrderBookMessage, put it directly in the output queue
+                if isinstance(message, OrderBookMessage):
+                    await output.put(message)
+                    continue
 
-    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        """Parse order book diff message and put it to the queue."""
-        try:
-            if "timestamp" not in raw_message:
-                raise ValueError("Incomplete message - missing timestamp")
+                # Handle string messages by attempting to parse them as JSON
+                if isinstance(message, str):
+                    try:
+                        message = json.loads(message)
+                    except json.JSONDecodeError:
+                        self.logger().error(f"Failed to parse trade message as JSON: {message}")
+                        continue
 
-            exchange_trading_pair = raw_message["product_id"]  # Get exchange format
-            timestamp = raw_message.get("timestamp", int(time.time()))
-            update_id = raw_message.get("seq", timestamp)
+                # Validate message is a dict
+                if not isinstance(message, dict):
+                    self.logger().error(f"Received non-dict message: {message}")
+                    continue
 
-            # Handle snapshot message
-            if (raw_message.get("feed") == CONSTANTS.WS_ORDER_BOOK_EVENTS_TOPIC or raw_message.get("feed") == "book_snapshot") and "bids" in raw_message and "asks" in raw_message:
-                bids, asks = self._get_bids_and_asks_from_ws_msg_data(raw_message)
-                order_book_message_content = {
-                    "trading_pair": exchange_trading_pair,  # Keep exchange format for snapshots
-                    "update_id": update_id,
-                    "bids": bids,
-                    "asks": asks
-                }
-                message = OrderBookMessage(
-                    message_type=OrderBookMessageType.SNAPSHOT,
-                    content=order_book_message_content,
-                    timestamp=timestamp
+                # Skip subscription confirmation messages
+                if message.get("event") == "subscribed":
+                    continue
+
+                # Validate feed type
+                feed = message.get("feed")
+                if not feed:
+                    self.logger().error(f"Message missing feed field: {message}")
+                    continue
+                if feed != CONSTANTS.WS_TRADES_TOPIC:
+                    continue  # Skip non-trade messages
+
+                # Validate required fields
+                required_fields = ["product_id", "price", "qty", "side", "seq"]
+                missing_fields = [field for field in required_fields if field not in message]
+                if missing_fields:
+                    self.logger().error(f"Message missing required fields {missing_fields}: {message}")
+                    continue
+
+                # Convert message to order book row format
+                msg = self._convert_trade_message_to_order_book_row(message)
+                await output.put(msg)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                                self.logger().error(
+                    f"Unexpected error when processing public trade updates from exchange: {str(e)}",
+                    exc_info=True
                 )
-                # Update sequence number and put message in queue
-                self._last_sequence_numbers[exchange_trading_pair] = update_id
-                await message_queue.put(message)
-                return
-
-            # Check if mapping is ready using the event
-            if not self._mapping_initialized.is_set():
-                self.logger().debug(f"Trading pair mapping not ready yet, queuing message for {exchange_trading_pair}")
-                return
-
-            # Try to get trading pair from connector mapping
-            try:
-                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(exchange_trading_pair)
-                self.logger().debug(f"Successfully converted {exchange_trading_pair} to {trading_pair}")
-            except KeyError:
-                self.logger().warning(f"Trading pair mapping not found for {exchange_trading_pair}, skipping message")
-                return
-            except Exception as e:
-                self.logger().error(f"Error converting trading pair {exchange_trading_pair}: {str(e)}")
-                return
-
-            # Skip out-of-order messages for diffs only
-            if trading_pair in self._last_sequence_numbers:
-                last_seq = self._last_sequence_numbers[trading_pair]
-                if update_id <= last_seq:
-                    self.logger().debug(f"Skipping out-of-order message - last seq: {last_seq}, msg seq: {update_id}")
-                    return
-
-            # Handle diff message
-            bids = []
-            asks = []
-            if raw_message.get("side") == "buy":
-                bids.append([float(raw_message["price"]), float(raw_message["qty"])])
-            elif raw_message.get("side") == "sell":
-                asks.append([float(raw_message["price"]), float(raw_message["qty"])])
-
-            order_book_message_content = {
-                "trading_pair": trading_pair,
-                "update_id": update_id,
-                "bids": bids,
-                "asks": asks
-            }
-            message = OrderBookMessage(
-                message_type=OrderBookMessageType.DIFF,
-                content=order_book_message_content,
-                timestamp=timestamp
-            )
-
-            # Update sequence number and put message in queue
-            self._last_sequence_numbers[trading_pair] = update_id
-            await message_queue.put(message)
-        except Exception as e:
-            self.logger().error(
-                f"Error processing order book message: {raw_message}. Error: {str(e)}",
-                exc_info=True
-            )
-
-    async def _parse_trade_message(self, message: Dict[str, Any], message_queue: asyncio.Queue):
-        """Parse trade message and put it in the queue."""
-        if message.get("feed") != CONSTANTS.WS_TRADES_TOPIC:
-            return
-
-        exchange_trading_pair = message["product_id"]  # Get exchange format
-        trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(exchange_trading_pair)  # Convert to connector format
-        timestamp = message["timestamp"] * 1e-3  # Convert to seconds
-        price = Decimal(str(message["price"]))
-        amount = Decimal(str(message["qty"]))
-        trade_type = TradeType.BUY if message.get("side", "").lower() == "buy" else TradeType.SELL
-
-        trade_msg = OrderBookMessage(
-            message_type=OrderBookMessageType.TRADE,
-            content={
-                "trading_pair": trading_pair,  # Using connector format
-                "trade_type": trade_type,
-                "trade_id": message.get("seq", int(timestamp * 1000)),
-                "update_id": message.get("seq", int(timestamp * 1000)),
-                "price": price,
-                "amount": amount,
-                "timestamp": timestamp
-            },
-            timestamp=timestamp
-        )
-
-        await message_queue.put(trade_msg)
-
-    async def _parse_funding_info_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        """
-        Parses a funding info message from the WebSocket stream and puts it into the message queue.
-        :param raw_message: The raw message from the WebSocket
-        :param message_queue: The queue to put the parsed message into
-        """
-        if raw_message["feed"] == CONSTANTS.WS_INSTRUMENTS_INFO_TOPIC:
-            try:
-                # The product_id field contains the symbol
-                if "product_id" not in raw_message:
-                    self.logger().debug(f"No product_id in message: {raw_message}")
-                    return
-                
-                symbol = raw_message["product_id"]
-                
-                # Check if mapping is initialized
-                if not self._mapping_initialized.is_set():
-                    self.logger().debug(f"Trading pair mapping not ready yet, skipping funding info for {symbol}")
-                    return
-                
-                try:
-                    # Use the connector's trading pair mapping
-                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
-                except KeyError:
-                    self.logger().debug(f"No trading pair mapping found for {symbol}, waiting for mapping to be ready")
-                    return
-                
-                if not trading_pair:
-                    self.logger().debug(f"No trading pair mapping found for {symbol}")
-                    return
-                
-                self.logger().debug(f"Processing funding info for {symbol} -> {trading_pair}")
-                
-                # Extract required fields with proper error handling
-                try:
-                    info_update = FundingInfoUpdate(
-                        trading_pair=trading_pair,
-                        index_price=Decimal(str(raw_message.get("markPrice", "0"))),
-                        mark_price=Decimal(str(raw_message.get("markPrice", "0"))),
-                        next_funding_utc_timestamp=int(raw_message.get("next_funding_rate_time", time.time())),
-                        rate=Decimal(str(raw_message.get("fundingRate", "0"))))
-                    await message_queue.put(info_update)
-                except (KeyError, ValueError) as e:
-                    self.logger().debug(f"Error extracting funding info fields: {e} from message: {raw_message}")
-            except Exception as e:
-                self.logger().debug(f"Error processing funding info message for {raw_message.get('product_id', 'unknown symbol')}: {str(e)}")
-                if self.logger().getEffectiveLevel() <= logging.DEBUG:
-                    self.logger().debug("Full traceback:", exc_info=True)
-
-    async def _process_message(self, message: Dict[str, Any], message_queue: asyncio.Queue):
-        """Process incoming WebSocket messages."""
-        try:
-            if message.get("event") == "error":
-                self.logger().error(f"WebSocket error: {message.get('errorCode')} - {message.get('message')}")
-                return
-            elif message.get("event") == "subscribed":
-                self.logger().info(f"Successfully subscribed to {message.get('feed')} feed")
-                return
-            elif message.get("event") == "unsubscribed":
-                self.logger().info(f"Successfully unsubscribed from {message.get('feed')} feed")
-                return
-
-            feed = message.get("feed")
-            self.logger().debug(f"Processing message from feed: {feed}")
-            self.logger().debug(f"Message content: {message}")
-
-            if feed == CONSTANTS.WS_ORDER_BOOK_EVENTS_TOPIC:
-                await self._process_order_book_message(message)
-            elif feed == CONSTANTS.WS_TRADES_TOPIC:
-                await self._process_trade_message(message)
-            elif feed == CONSTANTS.WS_INSTRUMENTS_INFO_TOPIC:
-                await self._parse_funding_info_message(message, message_queue)
-            elif feed == "ticker":
-                await self._process_ticker_message(message)
-            elif feed == "ticker_lite":
-                await self._process_ticker_lite_message(message)
-            elif feed == "heartbeat":
-                await self._process_heartbeat_message(message)
-            else:
-                self.logger().debug(f"Unknown message received: {message}")
-        except Exception as e:
-            self.logger().error(f"Error processing message: {message}. Error: {str(e)}", exc_info=True)
-
-    async def _process_websocket_messages(self, message: Dict[str, Any], message_queue: asyncio.Queue):
-        """Process WebSocket messages."""
-        try:
-            await self._process_message(message, message_queue)
-        except Exception as e:
-            self.logger().error(f"Error processing message: {str(e)}")
-            self.logger().error(f"Message: {message}")
-
-    async def _process_order_book_snapshot(self, snapshot_msg: Dict[str, Any], trading_pair: str) -> None:
-        """Process the order book snapshot message."""
-        snapshot_timestamp = snapshot_msg["timestamp"]
-        snapshot_msg = snapshot_msg["data"]
-
-        # Convert the trading pair to connector format
-        connector_trading_pair = get_exchange_trading_pair(trading_pair)
-
-        # Get the sequence number from the snapshot message
-        sequence_number = int(snapshot_msg.get("sequence", 0))
-
-        # Create the order book message
-        order_book_message = self._convert_snapshot_message_to_order_book_row(
-            snapshot_msg,
-            connector_trading_pair,
-            sequence_number,
-            snapshot_timestamp
-        )
-
-        # Update the order book with the snapshot
-        self._order_book_snapshot_queues[connector_trading_pair].put_nowait(order_book_message)
-
-    async def _subscribe_channels(self, ws: WSAssistant):
-        """
-        Subscribes to the trade events and diff orders events through the provided websocket connection.
-        :param ws: the websocket assistant used to connect to the exchange
-        """
-        try:
-            for trading_pair in self._trading_pairs:
-                payload = {
-                    "event": "subscribe",
-                    "feed": CONSTANTS.WS_INSTRUMENTS_INFO_TOPIC,
-                    "product_ids": [trading_pair],
-                }
-                subscribe_request: WSJSONRequest = WSJSONRequest(payload=payload)
-                await ws.send(subscribe_request)
-
-            self.logger().info("Subscribed to public order book and trade channels...")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger().error(
-                "Unexpected error occurred subscribing to order book trading and delta streams...",
-                exc_info=True
-            )
-            raise
+                                self.logger().error(f"Unexpected error in order book listener: {str(e)}", exc_info=True)
+                                await self._sleep(5.0)
