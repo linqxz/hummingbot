@@ -235,7 +235,12 @@ class TradeFeeBase(ABC):
             {"WAVAX", "AVAX"},
             {"WONE", "ONE"},
             {"USDC", "USDC.E"},
-            {"WBTC", "BTC"}
+            {"WBTC", "BTC"},
+            # Add USD and BTC as interchangeable to support Kraken Perpetual and other USD-based futures
+            {"USD", "BTC"},
+            {"USD", "USDT"},
+            {"USD", "BUSD"},
+            {"USD", "USDC"},
         ]
         return first_token == second_token or any(({first_token, second_token} <= interchangeable_pair
                                                    for interchangeable_pair

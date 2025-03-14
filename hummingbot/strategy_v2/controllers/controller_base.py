@@ -39,14 +39,14 @@ class ControllerConfigBase(BaseClientModel):
     controller_name: str
     controller_type: str = "generic"
     total_amount_quote: Decimal = Field(
-        default=100,
+        default=10000,
         client_data=ClientFieldData(
             is_updatable=True,
             prompt_on_new=True,
             prompt=lambda mi: "Enter the total amount in quote asset to use for trading (e.g., 1000):"))
     manual_kill_switch: bool = Field(default=None, client_data=ClientFieldData(is_updatable=True, prompt_on_new=False))
     candles_config: List[CandlesConfig] = Field(
-        default="binance_perpetual.WLD-USDT.1m.500",
+        default="binance_perpetual.BTC-USDT.1m.500",
         client_data=ClientFieldData(
             is_updatable=True,
             prompt_on_new=True,

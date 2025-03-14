@@ -15,24 +15,11 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 class KrakenPerpetualRESTPreProcessor(RESTPreProcessorBase):
     async def pre_process(self, request: RESTRequest) -> RESTRequest:
         request.headers = request.headers or {}
-        
-        # For POST requests with data, use application/x-www-form-urlencoded
-        if request.method == RESTMethod.POST or RESTMethod.PUT and request.data is not None:
-            request.headers["Content-Type"] = "application/x-www-form-urlencoded"
-            # Convert JSON string back to dict if it was converted earlier
-            if isinstance(request.data, str):
-                try:
-                    import json
-                    request.data = json.loads(request.data)
-                except json.JSONDecodeError:
-                    pass  # Keep original string if it's not JSON
-            # Convert dict to url-encoded format
-            if isinstance(request.data, dict):
-                from urllib.parse import urlencode
-                request.data = urlencode(request.data)
-        else:
-            # For other requests, use application/json
-            request.headers["Content-Type"] = "application/json"
+
+        # Convert dict to url-encoded format
+        if isinstance(request.data, dict):
+            from urllib.parse import urlencode
+            request.data = urlencode(sorted(request.data.items()))  # Sort items for consistent ordering
 
         return request
 
@@ -81,7 +68,7 @@ async def get_current_server_time(
     response = await rest_assistant.execute_request(
         url=url,
         method=RESTMethod.GET,
-        throttler_limit_id=GET_LIMIT_ID,
+        throttler_limit_id=PUBLIC_LIMIT_ID,
     )
 
     if response.get("serverTime") is not None:
@@ -154,16 +141,26 @@ def get_ws_url(domain: str = CONSTANTS.DEFAULT_DOMAIN, is_auth: bool = False) ->
 
 
 # Global rate limit IDs
-GET_LIMIT_ID = "GETLimit"
-POST_LIMIT_ID = "POSTLimit"
+PUBLIC_LIMIT_ID = "PublicLimit"  # For public endpoints with no rate limit
+DERIVATIVES_LIMIT_ID = "DerivativesLimit"  # For /derivatives endpoints
+HISTORY_LIMIT_ID = "HistoryLimit"  # For /history endpoints
 WS_REQUEST_LIMIT_ID = "WSRequestLimit"
 WS_CONNECTION_LIMIT_ID = "WSConnectionLimit"
 
-# Endpoint-specific rate limit IDs
-ORDER_LIMIT_ID = "OrderLimit"
-POSITION_LIMIT_ID = "PositionLimit"
-BALANCE_LIMIT_ID = "BalanceLimit"
-FILLS_LIMIT_ID = "FillsLimit"
+# Endpoint costs
+SEND_ORDER_COST = 10
+EDIT_ORDER_COST = 10
+CANCEL_ORDER_COST = 10
+BATCH_ORDER_BASE_COST = 9
+CANCEL_ALL_ORDERS_COST = 25
+ACCOUNT_INFO_COST = 2
+POSITIONS_INFO_COST = 2
+FILLS_COST = 2
+FILLS_WITH_TIME_COST = 25
+ORDER_STATUS_COST = 1
+OPEN_ORDERS_COST = 2
+LEVERAGE_GET_COST = 2
+LEVERAGE_PUT_COST = 10
 
 def get_rest_api_limit_id_for_endpoint(endpoint: Union[str, Dict[str, str]], method: RESTMethod = RESTMethod.GET) -> str:
     """
@@ -176,21 +173,22 @@ def get_rest_api_limit_id_for_endpoint(endpoint: Union[str, Dict[str, str]], met
     if isinstance(endpoint, dict):
         endpoint = next(iter(endpoint.values()))
 
-    # Order-related endpoints
-    if any(x in endpoint for x in ["/sendorder", "/cancelorder", "/orders/status", "/openorders"]):
-        return POST_LIMIT_ID if method == RESTMethod.POST else ORDER_LIMIT_ID
-    # Position-related endpoints
-    elif "/openpositions" in endpoint:
-        return POSITION_LIMIT_ID
-    # Balance-related endpoints
-    elif "/accounts" in endpoint:
-        return BALANCE_LIMIT_ID
-    # Fills-related endpoints
-    elif "/fills" in endpoint:
-        return FILLS_LIMIT_ID
-    # Default to HTTP method limit
-    else:
-        return POST_LIMIT_ID if method == RESTMethod.POST else GET_LIMIT_ID
+    # Public endpoints with no rate limits
+    if any(endpoint.startswith(prefix) for prefix in [
+        "/derivatives/api/v3/instruments",
+        "/derivatives/api/v3/tickers",
+        "/derivatives/api/v3/orderbook",
+        "/derivatives/api/v3/ticker",
+        "/derivatives/api/v3/time",
+    ]):
+        return PUBLIC_LIMIT_ID
+    
+    # History endpoints use the history pool
+    if "/history" in endpoint:
+        return HISTORY_LIMIT_ID
+    
+    # All other endpoints use the derivatives pool
+    return DERIVATIVES_LIMIT_ID
 
 def build_rate_limits() -> List[RateLimit]:
     """
@@ -198,19 +196,49 @@ def build_rate_limits() -> List[RateLimit]:
     :return: List of rate limits
     """
     rate_limits = [
-        # Global rate limits
-        RateLimit(limit_id=GET_LIMIT_ID, limit=100, time_interval=10),   # 100 GET requests per 10 seconds
-        RateLimit(limit_id=POST_LIMIT_ID, limit=50, time_interval=10),   # 50 POST requests per 10 seconds
+        # Public endpoints pool - no rate limit
+        RateLimit(
+            limit_id=PUBLIC_LIMIT_ID,
+            limit=10000000,  # High number
+            time_interval=1,
+            weight=0,  # No weight cost
+        ),
 
-        # Endpoint-specific rate limits
-        RateLimit(limit_id=ORDER_LIMIT_ID, limit=60, time_interval=10),  # 60 order requests per 10 seconds
-        RateLimit(limit_id=POSITION_LIMIT_ID, limit=10, time_interval=10),  # 10 position requests per 10 seconds
-        RateLimit(limit_id=BALANCE_LIMIT_ID, limit=10, time_interval=10),  # 10 balance requests per 10 seconds
-        RateLimit(limit_id=FILLS_LIMIT_ID, limit=10, time_interval=10),  # 10 fills requests per 10 seconds
+        # Main derivatives endpoints pool - 500 cost per 10 seconds
+        RateLimit(
+            limit_id=DERIVATIVES_LIMIT_ID,
+            limit=500,
+            time_interval=10,
+            linked_limits=[
+                LinkedLimitWeightPair("/derivatives/api/v3/sendorder", SEND_ORDER_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/editorder", EDIT_ORDER_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/cancelorder", CANCEL_ORDER_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/cancelallorders", CANCEL_ALL_ORDERS_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/accounts", ACCOUNT_INFO_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/openpositions", POSITIONS_INFO_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/fills", FILLS_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/orders/status", ORDER_STATUS_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/openorders", OPEN_ORDERS_COST),
+                LinkedLimitWeightPair("/derivatives/api/v3/leveragepreferences", LEVERAGE_GET_COST),
+            ]
+        ),
+
+        # History endpoints pool - 100 cost per 10 minutes
+        RateLimit(
+            limit_id=HISTORY_LIMIT_ID,
+            limit=100,
+            time_interval=600,  # 10 minutes
+            linked_limits=[
+                LinkedLimitWeightPair("/derivatives/api/v3/historicalorders", 1),
+                LinkedLimitWeightPair("/derivatives/api/v3/historicaltriggers", 1),
+                LinkedLimitWeightPair("/derivatives/api/v3/historicalexecutions", 1),
+                LinkedLimitWeightPair("/derivatives/api/v3/accountlog", 1),  # Default cost, varies by count parameter
+            ]
+        ),
 
         # WebSocket limits
         RateLimit(limit_id=WS_REQUEST_LIMIT_ID, limit=100, time_interval=1),    # 100 requests per second
-        RateLimit(limit_id=WS_CONNECTION_LIMIT_ID, limit=50, time_interval=60),  # 50 connections per minute
+        RateLimit(limit_id=WS_CONNECTION_LIMIT_ID, limit=100, time_interval=0),  # 100 concurrent connections
     ]
 
     return rate_limits
@@ -235,8 +263,8 @@ def build_ws_connection_limit() -> RateLimit:
     """
     return RateLimit(
         limit_id=WS_CONNECTION_LIMIT_ID,
-        limit=50,  # 50 connections per minute
-        time_interval=60,
+        limit=100,  # 100 concurrent connections
+        time_interval=0,
     )
 
 

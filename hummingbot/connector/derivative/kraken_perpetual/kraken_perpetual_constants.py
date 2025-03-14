@@ -12,7 +12,7 @@ HBOT_BROKER_ID = "KRKN"
 # Base URLs
 REST_URLS = {
     "kraken_perpetual_main": "https://futures.kraken.com",
-    "kraken_perpetual_testnet": "https://demo-futures.kraken.com"
+        "kraken_perpetual_testnet": "https://demo-futures.kraken.com"
 }
 WSS_URLS = {
     "kraken_perpetual_main": "wss://futures.kraken.com/ws/v1",
@@ -123,6 +123,7 @@ ORDER_STATE = {
     "untouched": OrderState.OPEN,
     "placed": OrderState.OPEN,
     "CANCELLED": OrderState.CANCELED,
+    "CANCELED": OrderState.CANCELED,
     "pending": OrderState.PENDING_CREATE,
     "open": OrderState.OPEN,
     "closed": OrderState.FILLED,
@@ -266,6 +267,3 @@ ACCOUNT_LOG_COSTS = {
 }
 
 POSITION_IDX_ONEWAY = 0
-
-# REST endpoints
-SNAPSHOT_REST_URL = "/api/v3/orderbook"

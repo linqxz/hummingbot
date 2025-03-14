@@ -74,6 +74,13 @@ class TrackedOrder:
             return Decimal("0")
 
     @property
+    def is_filled(self):
+        if self.order:
+            return self.order.is_filled
+        else:
+            return False
+
+    @property
     def executed_amount_quote(self):
         if self.order:
             return self.order.executed_amount_quote

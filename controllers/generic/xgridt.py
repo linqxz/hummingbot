@@ -193,7 +193,7 @@ class XGridTConfig(ControllerConfigBase):
     candles_config: List[CandlesConfig] = []
     connector_name: str = "binance_perpetual"
     trading_pair: str = "WLD-USDT"
-    candles_connector: str = "binance_perpetual"
+    candles_connector: str = "binance_perpetual"BT
     candles_trading_pair: str = "WLD-USDT"
     interval: str = "1m"
     # EMAs

@@ -103,11 +103,11 @@ class KrakenPerpetualUserStreamDataSource(UserStreamTrackerDataSource):
                         "feed": feed
                     }
                 else:
-                    payload = self._auth.get_ws_subscribe_payload(
-                        feed=feed,
-                        challenge=self._challenge,
-                        signed_challenge=self._signed_challenge
-                    )
+                    payload = self._auth.get_ws_subscribe_payload(feed=feed)
+                
+                # Log fills subscription request specifically
+                if feed == CONSTANTS.WS_FILLS_TOPIC:
+                    self.logger().info(f"Sending fills subscription request: {payload}")
                 
                 await ws.send(WSJSONRequest(payload=payload))
 
@@ -125,7 +125,12 @@ class KrakenPerpetualUserStreamDataSource(UserStreamTrackerDataSource):
 
             # Handle subscription responses
             if event_message.get("event") == "subscribed":
-                self.logger().info(f"Successfully subscribed to {event_message.get('feed')} feed")
+                feed = event_message.get("feed")
+                self.logger().info(f"Successfully subscribed to {feed} feed")
+                
+                # Log detailed information for fills subscription confirmation
+                if feed == CONSTANTS.WS_FILLS_TOPIC:
+                    self.logger().info(f"FILLS FEED SUBSCRIBED: {event_message}")
                 return
             elif event_message.get("event") == "error":
                 self.logger().error(f"Error in user stream: {event_message.get('message', '')}")
@@ -135,6 +140,10 @@ class KrakenPerpetualUserStreamDataSource(UserStreamTrackerDataSource):
             feed = event_message.get("feed")
             if not feed:
                 return
+                
+            # Log all fills feed messages
+            if feed == CONSTANTS.WS_FILLS_TOPIC or feed == "fills_snapshot":
+                self.logger().info(f"FILLS FEED MESSAGE RECEIVED: {event_message}")
 
             # Convert message to the expected format
             formatted_message = self._format_message(event_message)
@@ -166,13 +175,20 @@ class KrakenPerpetualUserStreamDataSource(UserStreamTrackerDataSource):
                     "data": message,
                     "feed": message.get("feed")
                 }
-            elif feed == CONSTANTS.WS_FILLS_TOPIC:
-                return {
+            elif feed == CONSTANTS.WS_FILLS_TOPIC or feed == "fills_snapshot":
+                # Log detailed fills message before formatting
+                self.logger().info(f"FILLS FEED FORMATTING MESSAGE: {message}")
+                
+                formatted = {
                     "event_type": "trade",
                     "timestamp": timestamp,
                     "data": message,
                     "feed": message.get("feed")
                 }
+                
+                # Log the formatted message
+                self.logger().info(f"FILLS FEED FORMATTED MESSAGE: {formatted}")
+                return formatted
             elif feed == CONSTANTS.WS_OPEN_POSITIONS_TOPIC:
                 return {
                     "event_type": "position",

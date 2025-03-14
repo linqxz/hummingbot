@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import urlencode, urlparse
 
 from hummingbot.connector.derivative.kraken_perpetual import kraken_perpetual_constants as CONSTANTS
@@ -54,9 +54,6 @@ class KrakenPerpetualAuth(AuthBase):
         :param time_provider: Time synchronizer instance
         """
         self._logger = logging.getLogger(__name__)
-        # self._logger.info("=== Initializing KrakenPerpetualAuth ===")
-        # self._logger.info(f"API key length: {len(api_key) if api_key else 0}")
-        # self._logger.info(f"Secret key length: {len(secret_key) if secret_key else 0}")
         
         self.api_key = api_key
         self.secret_key = secret_key
@@ -64,29 +61,37 @@ class KrakenPerpetualAuth(AuthBase):
         self._last_nonce = 0  # Track last nonce value
         self._nonce_lock = threading.Lock()  # Lock for thread-safe nonce generation
         
-        # self._logger.info("Validating auth keys...")
+        # Challenge and signed challenge for WebSocket authentication
+        self._original_challenge = None
+        self._signed_challenge = None
+        
         self._validate_auth_keys()  # Validate keys during initialization
-        # self._logger.info("Auth keys validated successfully")
+
+    @property
+    def original_challenge(self) -> Optional[str]:
+        """Get the original challenge received from the WebSocket server"""
+        return self._original_challenge
+        
+    @property
+    def signed_challenge(self) -> Optional[str]:
+        """Get the signed challenge used for WebSocket authentication"""
+        return self._signed_challenge
 
     @staticmethod
     def _is_valid_api_key(api_key: str) -> bool:
         """Validates API key format."""
         logger = logging.getLogger(__name__)
-        # logger.info("=== Validating API key ===")
         if not api_key:
             logger.info("API key is empty")
             return False
         # API key should be at least 32 characters and contain only valid URL-safe base64 characters
         is_valid = len(api_key) >= 32 and all(c.isalnum() or c in ['-', '_', '+', '/', '='] for c in api_key)
-        # logger.info(f"API key length: {len(api_key)}")
-        # logger.info(f"API key contains valid characters: {is_valid}")
         return is_valid
 
     @staticmethod
     def _is_valid_base64(s: str) -> bool:
         """Validates if a string contains only valid base64 characters."""
         logger = logging.getLogger(__name__)
-        # logger.info("=== Validating base64 string ===")
         try:
             if not s:
                 logger.info("String is empty")
@@ -98,8 +103,6 @@ class KrakenPerpetualAuth(AuthBase):
             base64.b64decode(s)
             # Check if string contains only valid base64 characters (including URL-safe variants)
             is_valid = all(c.isalnum() or c in ['-', '_', '+', '/', '='] for c in s)
-            # logger.info(f"String length: {len(s)}")
-            # logger.info(f"Contains valid base64 characters: {is_valid}")
             return is_valid
         except Exception as e:
             logger.error(f"Base64 validation error: {str(e)}")
@@ -107,24 +110,20 @@ class KrakenPerpetualAuth(AuthBase):
 
     def _validate_auth_keys(self):
         """Validates API key and secret key format."""
-        # self._logger.info("=== Validating auth keys ===")
         # Skip validation if both keys are empty (trading not required)
         if not self.api_key and not self.secret_key:
             self._logger.info("Both keys are empty - skipping validation")
             return
 
-        # self._logger.info("Validating API key...")
         if not self._is_valid_api_key(self.api_key):
             self._logger.error("API key validation failed")
             raise KrakenPerpetualAuthError("Invalid API key format", "invalidKey")
 
-        # self._logger.info("Validating secret key...")
         try:
             if not self._is_valid_base64(self.secret_key):
                 self._logger.error("Secret key is not valid base64")
                 raise ValueError("Invalid base64 characters in secret key")
             base64.b64decode(self.secret_key)
-            # self._logger.info("Secret key validation successful")
         except Exception as e:
             self._logger.error(f"Secret key validation error: {str(e)}")
             raise KrakenPerpetualAuthError(f"Secret key must be base64 encoded: {str(e)}", "invalidKey")
@@ -149,7 +148,6 @@ class KrakenPerpetualAuth(AuthBase):
         Note: The /derivatives prefix will be removed in the auth string generation.
         Raises ValueError if URL is not a valid Kraken Perpetual URL.
         """
-        # self._logger.info(f"Extracting endpoint path from URL: {url}")
         parsed_url = urlparse(url)
         
         # Validate that this is a Kraken Perpetual URL
@@ -158,7 +156,6 @@ class KrakenPerpetualAuth(AuthBase):
             raise ValueError(f"Invalid Kraken Perpetual URL domain: {url}")
             
         path = parsed_url.path
-        # self._logger.info(f"Extracted path: {path}")
         
         # Validate that path starts with one of the expected prefixes
         if not (path.startswith("/derivatives/api/v3/") or path.startswith("/api/history/v2/")):
@@ -180,33 +177,23 @@ class KrakenPerpetualAuth(AuthBase):
         # Remove /derivatives prefix if present
         if endpoint_path.startswith('/derivatives'):
             endpoint_path = endpoint_path[len('/derivatives'):]
-            
-        # self._logger.info("=== Generating auth string ===")
-        # self._logger.info(f"Post data: {post_data}")
-        # self._logger.info(f"Nonce: {nonce}")
-        # self._logger.info(f"Endpoint path (after prefix removal): {endpoint_path}")
 
         # Step 1: Concatenate postData + nonce + endpoint
         message = f"{post_data}{nonce}{endpoint_path}"
-        # self._logger.info(f"Concatenated message: {message}")
 
         # Step 2: Hash with SHA256
         sha256_hash = hashlib.sha256()
         sha256_hash.update(message.encode('utf8'))
         hash_digest = sha256_hash.digest()
-        # self._logger.info(f"SHA-256 hash (hex): {hash_digest.hex()}")
 
         # Step 3: Base64 decode API secret
         secret_decoded = base64.b64decode(self.secret_key)
-        # self._logger.info(f"Decoded secret length: {len(secret_decoded)}")
 
         # Step 4: Hash with HMAC-SHA512
         hmac_digest = hmac.new(secret_decoded, hash_digest, hashlib.sha512).digest()
-        # self._logger.info(f"HMAC digest (hex): {hmac_digest.hex()}")
 
         # Step 5: Base64 encode final result
         auth_string = base64.b64encode(hmac_digest).decode('utf-8')
-        # self._logger.info(f"Final auth string: {auth_string}")
 
         return auth_string
 
@@ -230,7 +217,7 @@ class KrakenPerpetualAuth(AuthBase):
             # For POST/PUT requests, ensure data is properly url-encoded
             if isinstance(request.data, str):
                 try:
-                    # If it's a JSON string, parse it firs
+                    # If it's a JSON string, parse it first
                     data_dict = json.loads(request.data)
                 except json.JSONDecodeError:
                     # If not JSON, assume it's already url-encoded
@@ -248,73 +235,91 @@ class KrakenPerpetualAuth(AuthBase):
             request.data = post_data
             
         elif request.method == RESTMethod.GET and request.params:
-            # For GET requests with params, convert to sorted key=value format
-            post_data = urlencode(sorted(request.params.items()))
+            # For GET requests with parameters, encode them
+            if isinstance(request.params, dict):
+                post_data = urlencode(sorted(request.params.items()))
+            else:
+                post_data = str(request.params)
 
-        # Generate auth string
-        auth_string = self._generate_auth_string(post_data, nonce, endpoint_path)
+        # Generate authentication signature
+        auth_signature = self._generate_auth_string(post_data, nonce, endpoint_path)
 
-        # Set required headers
-        content_type = "application/x-www-form-urlencoded" if request.method in [RESTMethod.POST, RESTMethod.PUT] else "application/json"
-        request.headers = {
-            "Content-Type": content_type,
-            "Accept": "application/json",
+        # Add authentication headers
+        request.headers = request.headers or {}
+        request.headers.update({
             "APIKey": self.api_key,
-            "Authent": auth_string,
+            "Authent": auth_signature,
             "Nonce": nonce
-        }
+        })
 
         return request
 
-    async def ws_authenticate(self, ws: WSRequest) -> None:
+    async def ws_authenticate(self, ws: WSRequest) -> Tuple[str, str]:
         """
         Authenticates WebSocket connection using challenge-response mechanism.
         The signed challenge will be used in subsequent private feed subscriptions.
+        Returns the challenge and signed challenge for use in subscriptions.
         """
         try:
+            self._logger.info("Starting WebSocket authentication process")
             self._validate_auth_keys()
             
             # First receive the initial info message
             info_response = await ws.receive()
             if not isinstance(info_response.data, dict):
+                self._logger.error(f"Invalid info response format: {info_response.data}")
                 raise KrakenPerpetualAuthError("Invalid info response format")
             if info_response.data.get("event") != "info":
+                self._logger.error(f"Expected info message, got: {info_response.data}")
                 raise KrakenPerpetualAuthError(f"Expected info message, got: {info_response.data}")
+            
+            self._logger.info("Received info message, sending challenge request")
             
             # Step 1: Request challenge from Kraken futures API
             challenge_request = {
                 "event": "challenge",
                 "api_key": self.api_key
             }
-            self._logger.info(f"Sending challenge request: {challenge_request}")
+            self._logger.debug(f"Sending challenge request: {json.dumps(challenge_request)}")
             await ws.send(WSJSONRequest(payload=challenge_request))
 
             # Step 2: Wait for challenge response
             challenge_response = await ws.receive()
             if not isinstance(challenge_response.data, dict):
+                self._logger.error(f"Invalid challenge response format: {challenge_response.data}")
                 raise KrakenPerpetualAuthError("Invalid challenge response format")
             if challenge_response.data.get("event") == "error":
+                self._logger.error(f"Challenge error: {challenge_response.data}")
                 raise KrakenPerpetualAuthError(
                     challenge_response.data.get("message", "Unknown error"),
                     challenge_response.data.get("errorCode")
                 )
             if challenge_response.data.get("event") != "challenge":
+                self._logger.error(f"Expected challenge message, got: {challenge_response.data}")
                 raise KrakenPerpetualAuthError(f"Expected challenge message, got: {challenge_response.data}")
             
             challenge = challenge_response.data.get("message")
             if not challenge:
+                self._logger.error("No challenge received in response")
                 raise KrakenPerpetualAuthError("No challenge received")
+
+            self._logger.info(f"Received challenge: {challenge}")
 
             # Step 3: Sign challenge and store for feed subscriptions
             signed_challenge = self.sign_ws_challenge(challenge)
+            self._logger.info(f"Challenge signed successfully")
+            
             # Store challenge details for later subscription payloads
             self._original_challenge = challenge
             self._signed_challenge = signed_challenge
-            self._logger.info("Challenge signed and stored for feed subscriptions")
+            self._logger.info("Challenge and signed challenge stored for feed subscriptions")
+            
+            return challenge, signed_challenge
 
         except KrakenPerpetualAuthError:
             raise
         except Exception as e:
+            self._logger.error(f"WebSocket authentication error: {str(e)}", exc_info=True)
             raise KrakenPerpetualAuthError(f"WebSocket authentication error: {str(e)}")
 
     def sign_ws_challenge(self, challenge: str) -> str:
@@ -355,20 +360,28 @@ class KrakenPerpetualAuth(AuthBase):
             "Nonce": nonce
         }
 
-    def get_ws_subscribe_payload(self, feed: str, challenge: str, signed_challenge: str) -> Dict[str, Any]:
+    def get_ws_subscribe_payload(self, feed: str, challenge: Optional[str] = None, signed_challenge: Optional[str] = None) -> Dict[str, Any]:
         """
         Generates payload for websocket subscription with authentication
         :param feed: The feed to subscribe to
-        :param challenge: The original challenge string
-        :param signed_challenge: The signed challenge string
+        :param challenge: The original challenge string (if provided, otherwise uses stored value)
+        :param signed_challenge: The signed challenge string (if provided, otherwise uses stored value)
         :return: A dictionary with subscription information
         """
+        # Use provided values or fall back to stored values
+        challenge_to_use = challenge if challenge is not None else self._original_challenge
+        signed_challenge_to_use = signed_challenge if signed_challenge is not None else self._signed_challenge
+        
+        if not challenge_to_use or not signed_challenge_to_use:
+            self._logger.warning(f"Missing challenge or signed challenge for {feed} subscription")
+            self._logger.debug(f"Challenge: {challenge_to_use}, Signed challenge: {signed_challenge_to_use}")
+        
         return {
             "event": "subscribe",
             "feed": feed,
             "api_key": self.api_key,
-            "original_challenge": challenge,
-            "signed_challenge": signed_challenge,
+            "original_challenge": challenge_to_use,
+            "signed_challenge": signed_challenge_to_use,
         }
 
     def get_ws_challenge_payload(self) -> Dict[str, Any]:
@@ -377,7 +390,6 @@ class KrakenPerpetualAuth(AuthBase):
         :return: A dictionary with challenge request information
         """
         return {
-            "event": "subscribe",
-            "feed": "heartbeat",
+            "event": "challenge",
             "api_key": self.api_key
         }

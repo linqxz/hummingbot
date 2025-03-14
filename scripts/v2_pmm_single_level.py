@@ -81,6 +81,8 @@ class PMMWithPositionExecutorConfig(StrategyV2ConfigBase):
                 pass
         raise ValueError(f"Invalid order type: {v}. Valid options are: {', '.join(OrderType.__members__)}")
 
+
+
     @property
     def triple_barrier_config(self) -> TripleBarrierConfig:
         return TripleBarrierConfig(

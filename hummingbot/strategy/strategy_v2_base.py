@@ -273,7 +273,7 @@ class StrategyV2Base(ScriptStrategyBase):
     def is_perpetual(connector: str) -> bool:
         return "perpetual" in connector
 
-    async def on_stop(self):
+    async def on_stop(self) -> None:
         self.executor_orchestrator.stop()
         self.market_data_provider.stop()
         self.listen_to_executor_actions_task.cancel()

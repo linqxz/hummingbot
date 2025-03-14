@@ -33,6 +33,7 @@ from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.core.event.events import AssignmentFillEvent, MarketEvent
 
 if TYPE_CHECKING:
     from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -61,6 +62,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         self._trading_pairs = trading_pairs
         self._domain = domain
         self._last_trade_history_timestamp = None
+        self._total_collateral_value = Decimal("0")  # Add this line to store total collateral value
 
         # Order history cache related attributes
         self._order_history_cache = {}
@@ -107,7 +109,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         """
         return [PositionMode.ONEWAY]  # Kraken only supports one-way positions
 
-    async def set_position_mode(self, position_mode: PositionMode):
+    def set_position_mode(self, position_mode: PositionMode):
         """
         Sets the position mode for the exchange.
         :param position_mode: The position mode to set.
@@ -121,7 +123,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
         """
-        Since Kraken only supports one-way positions, this always returns success for ONEWAY mode.
+        Since Kraken only supports one-way positions, this always returns success for ONEWAY mode.conn
         """
         if mode != PositionMode.ONEWAY:
             return False, "Kraken only supports the ONEWAY position mode."
@@ -138,7 +140,10 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
     async def _make_trading_pairs_request(self) -> Any:
         """Make a request to get the list of trading pairs from the exchange."""
         try:
-            exchange_info_response = await self._api_get(path_url=self.trading_pairs_request_path)
+            exchange_info_response = await self._api_get(
+                path_url=self.trading_pairs_request_path,
+                limit_id=web_utils.PUBLIC_LIMIT_ID,
+            )
 
             if isinstance(exchange_info_response, dict):
                 if exchange_info_response.get("result") != "success":
@@ -156,7 +161,10 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _make_trading_rules_request(self) -> Any:
         """Make a request to get the trading rules from the exchange."""
-        trading_rules_response = await self._api_get(path_url=self.trading_rules_request_path)
+        trading_rules_response = await self._api_get(
+            path_url=self.trading_rules_request_path,
+            limit_id=web_utils.PUBLIC_LIMIT_ID,
+        )
 
         if isinstance(trading_rules_response, list):
             return trading_rules_response
@@ -287,7 +295,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             "cliOrdId": tracked_order.client_order_id,
         }
 
-        # self.logger().info(f"Cancel request data: {data}")
+        self.logger().info(f"Cancel request data: {data}")
 
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ACTIVE_ORDER_PATH_URL,
@@ -296,17 +304,17 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             trading_pair=tracked_order.trading_pair,
         )
 
-        # self.logger().info(f"Cancel result: {cancel_result}")
+        self.logger().info(f"Cancel result: {cancel_result}")
 
         if cancel_result["result"] != "success":
             error_msg = cancel_result.get("error", "Unknown error")
             if "order not found" in error_msg.lower():
-                # self.logger().info(f"Order not found during cancellation - Order ID: {order_id}")
+                self.logger().info(f"Order not found during cancellation - Order ID: {order_id}")
                 await self._order_tracker.process_order_not_found(tracked_order.client_order_id)
-                # self.logger().info(f"Order state after not found:"
-                #                  f"\n  - State: {tracked_order.current_state}"
-                #                  f"\n  - Is Done: {tracked_order.is_done}"
-                #                  f"\n  - Is Cancelled: {tracked_order.is_cancelled}")
+                self.logger().info(f"Order state after not found:"
+                                 f"\n  - State: {tracked_order.current_state}"
+                                 f"\n  - Is Done: {tracked_order.is_done}"
+                                 f"\n  - Is Cancelled: {tracked_order.is_cancelled}")
                 return True
             self.logger().warning(f"Failed to cancel order {order_id} ({error_msg})")
             raise IOError(f"Error cancelling order: {error_msg}")
@@ -361,6 +369,9 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             **kwargs,
         )
 
+        # Add detailed debugging of the API response
+        self.logger().info(f"Kraken API response for {order_type.name} order: {order_result}")
+
         if order_result.get("result") != "success":
             error_msg = order_result.get("error", "Unknown error")
             raise IOError(f"Error placing order: {error_msg}")
@@ -371,10 +382,34 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             exchange_order_id = order_result["sendStatus"]["order_id"]
         elif "sendStatus" in order_result and "orderEvents" in order_result["sendStatus"]:
             order_events = order_result["sendStatus"]["orderEvents"]
-            if order_events and "order" in order_events[0]:
-                exchange_order_id = order_events[0]["order"]["orderId"]
+            self.logger().info(f"Order events in response: {order_events}")
+            if order_events and len(order_events) > 0:
+                if "order" in order_events[0]:
+                    exchange_order_id = order_events[0]["order"]["orderId"]
+                # Also check for other possible formats
+                elif "orderPriorExecution" in order_events[0]:
+                    exchange_order_id = order_events[0]["orderPriorExecution"]["orderId"]
+                    self.logger().info(f"Found order ID in orderPriorExecution: {exchange_order_id}")
+                elif "executionId" in order_events[0]:
+                    exchange_order_id = order_events[0]["executionId"]
+                    self.logger().info(f"Using executionId as order ID: {exchange_order_id}")
+
+        # Log the complete response for market orders to help debug
+        if order_type == OrderType.MARKET:
+            self.logger().info(f"MARKET ORDER RESPONSE DEBUG - Full response: {order_result}")
+            self.logger().info(f"MARKET ORDER RESPONSE DEBUG - Order ID extracted: {exchange_order_id}")
+            self.logger().info(f"MARKET ORDER RESPONSE DEBUG - Order parameters: {data}")
 
         if not exchange_order_id:
+            # If we still can't find an order ID, try to use any ID in the response as fallback
+            if "sendStatus" in order_result:
+                if "status" in order_result["sendStatus"] and order_result["sendStatus"]["status"] == "placed":
+                    # For successful orders that don't have a clear ID, generate one based on timestamp
+                    fallback_id = f"fallback-{order_id}-{self.current_timestamp}"
+                    self.logger().warning(f"Could not extract order ID from response, using fallback ID: {fallback_id}")
+                    return fallback_id, self.current_timestamp
+            
+            # If all else fails, raise the exception
             raise IOError("Could not extract order ID from response")
 
         return str(exchange_order_id), self.current_timestamp
@@ -440,8 +475,6 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         for trading_pair in self._trading_pairs:
             exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
             body_params = {
-                "symbol": exchange_symbol,
-                "limit": 200,
             }
             if self._last_trade_history_timestamp:
                 dt = datetime.strptime(self._last_trade_history_timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
@@ -559,6 +592,10 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             flex_account = wallet_balance_response.get("accounts", {}).get("flex", {})
 
             if flex_account:
+                # Update total collateral value
+                self._total_collateral_value = Decimal(str(flex_account.get("collateralValue", "0")))
+                # self.logger().debug(f"Updated total collateral value: {self._total_collateral_value}")
+
                 currencies = flex_account.get("currencies", {})
                 for currency, balance_data in currencies.items():
                     # Convert XBT to BTC if needed
@@ -572,13 +609,11 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                     if total_balance > Decimal("0"):
                         self._account_balances[normalized_currency] = total_balance
                         self._account_available_balances[normalized_currency] = available_balance
-                        self.logger().debug(f"Updated {normalized_currency} balance - Total: {total_balance}, Available: {available_balance}")
+                        # self.logger().debug(f"Updated {normalized_currency} balance - Total: {total_balance}, Available: {available_balance}")
 
-            # Log portfolio summary if available
-            if flex_account:
+                # Log portfolio summary if available
                 portfolio_value = Decimal(str(flex_account.get("portfolioValue", "0")))
-                collateral_value = Decimal(str(flex_account.get("collateralValue", "0")))
-                self.logger().debug(f"Portfolio Value: {portfolio_value}, Collateral Value: {collateral_value}")
+                # self.logger().debug(f"Portfolio Value: {portfolio_value}, Collateral Value: {self._total_collateral_value}")
         except Exception as e:
             self.logger().error(f"Error updating balances: {str(e)}", exc_info=True)
             raise
@@ -803,38 +838,28 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             path_url=CONSTANTS.QUERY_ACTIVE_ORDER_PATH_URL,
             data=active_order_data,
             is_auth_required=True,
+            limit_id=web_utils.DERIVATIVES_LIMIT_ID,  # Use derivatives pool with appropriate cost
             trading_pair=tracked_order.trading_pair,
         )
 
     async def _request_order_history_data(self, tracked_order: InFlightOrder) -> Dict[str, Any]:
         """
         Request order history data from the exchange.
-        Filters events to only process those matching our client ID.
-        Also fetches and processes fills for filled orders.
-
-        :param tracked_order: The InFlightOrder being tracked
-        :return: Dictionary containing the order history response
+        Uses the history rate limit pool.
         """
         try:
-            # self.logger().info(f"\n=== Requesting Order History ===\nLooking for order: {tracked_order.client_order_id}")
-
-            # Prepare history request parameters
             history_params = {
                 "limit": 1000,  # Limit to last 100 events
                 "sort": "desc",  # Most recent first
-
             }
-
-            # self.logger().info(f"Requesting order history with params: {history_params}")
 
             history_resp = await self._api_get(
                 path_url=CONSTANTS.HISTORY_ORDERS_ENDPOINT,
                 params=history_params,
                 is_auth_required=True,
+                limit_id=web_utils.HISTORY_LIMIT_ID,  # Use history pool with appropriate cost
                 trading_pair=tracked_order.trading_pair
             )
-
-            # self.logger().info(f"Raw history response: {history_resp}")
 
             if not history_resp:
                 self.logger().warning(f"Empty response received for order history request")
@@ -842,9 +867,6 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
 
             if isinstance(history_resp, dict):
                 events = history_resp.get("elements", [])
-                # self.logger().info(f"Found {len(events)} events in history")
-
-                # Format the response to match what the processor expects
                 formatted_orders = []
 
                 for event in events:
@@ -882,9 +904,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                                 }
                             })
 
-                return {"result": "success", "orders": formatted_orders}
-
-            return {"result": "success", "orders": []}
+            return {"result": "success", "orders": formatted_orders}
 
         except Exception as e:
             self.logger().error(f"Error requesting order history for {tracked_order.client_order_id}: {str(e)}", exc_info=True)
@@ -920,10 +940,10 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
 
         async for event_message in self._iter_user_event_queue():
             try:
-                self.logger().debug(f"\nReceived user stream message: {event_message}")
-                
+                # self.logger().debug(f"\nReceived user stream message: {event_message}")
+                #
                 # Handle subscription messages
-                if event_message.get("event") == "subscribed":
+                if isinstance(event_message, dict) and event_message.get("event") == "subscribed":
                     feed = event_message.get("feed")
                     if feed:
                         confirmed_feeds.add(feed)
@@ -936,30 +956,36 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                             self._user_stream_tracker.data_source._user_stream_event.set()
                     continue
 
-                # Process messages based on feed type
-                feed = event_message.get("feed")
-                if feed == "open_positions":
-                    self.logger().info("Processing position update")
-                    await self._process_account_position_event(event_message)
-                elif feed == "open_orders_verbose":
-                    self.logger().info("Processing order update")
-                    self._process_order_event_message(event_message)
-                elif feed == "fills":
-                    self.logger().info("Processing trade update")
-                    self._process_trade_event_message(event_message)
-                elif feed == "balances":
-                    self.logger().info("Processing balance update")
-                    self._process_wallet_event_message(event_message)
-                elif feed == "notifications_auth":
-                    # Only log notifications that contain actual notifications
-                    notifications = event_message.get("data", {}).get("notifications", [])
-                    if notifications:  # Only log if there are actual notifications
-                        self.logger().info(f"Received notifications: {notifications}")
-                elif feed == "account_log":
-                    self.logger().debug(f"Received account log: {event_message}")
+                # Process formatted messages based on event_type
+                if isinstance(event_message, dict):
+                    event_type = event_message.get("event_type")
+                    data = event_message.get("data", {})
+                    feed = data.get("feed") if isinstance(data, dict) else None
+                    
+                    if event_type == "position":
+                        self.logger().info("Processing position update")
+                        await self._process_account_position_event(data)
+                    elif event_type == "order":
+                        self.logger().info("Processing order update")
+                        self._process_order_event_message(data)
+                    elif event_type == "trade":
+                        self.logger().info("Processing trade update")
+                        self._process_trade_event_message(data)
+                    elif event_type == "balance":
+                        # self.logger().info("Processing balance update")
+                        self._process_wallet_event_message(data)
+                    elif event_type == "notification":
+                        # Only log notifications that contain actual notifications
+                        notifications = data.get("notifications", [])
+                        if notifications:  # Only log if there are actual notifications
+                            self.logger().info(f"Received notifications: {notifications}")
+                    elif event_type == "account_log":
+                        self.logger().debug(f"Received account log: {data}")
+                    else:
+                        self.logger().warning(f"Received message with unhandled event_type: {event_type}")
+                        # self.logger().debug(f"Message content: {event_message}")
                 else:
-                    self.logger().warning(f"Received message from unhandled feed: {feed}")
-                    self.logger().debug(f"Message content: {event_message}")
+                    self.logger().warning(f"Received non-dict message: {event_message}")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -973,45 +999,60 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         """
         try:
             # Extract positions array from the message
-            positions = position_msg.get("positions", [])
+            positions = []
+            
+            # Check if positions are directly in the message or nested in data field
+            if "positions" in position_msg:
+                positions = position_msg["positions"]
+            elif "data" in position_msg and isinstance(position_msg["data"], dict):
+                data = position_msg["data"]
+                if "positions" in data:
+                    positions = data["positions"]
+            
             if not positions:
                 self.logger().debug("No positions in message")
                 return
-
+            
             for position in positions:
                 ex_trading_pair = position.get("instrument")
                 if not ex_trading_pair:
                     self.logger().error(f"No instrument in position data: {position}")
                     continue
-
+                
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=ex_trading_pair)
-
-                # For determining position side, check if pnl_currency exists and matches quote asset
-                base_asset, quote_asset = trading_pair.split("-")
-                position_side = PositionSide.LONG
-                if "pnl_currency" in position:
-                    position_side = PositionSide.LONG if position["pnl_currency"] == quote_asset else PositionSide.SHORT
-
+                
+                # Get the raw balance amount
                 amount = Decimal(str(position.get("balance", "0")))
+                
+                # Determine position side based on amount sign
+                # Negative amount = SHORT position
+                # Positive amount = LONG position
+                position_side = PositionSide.SHORT if amount < Decimal("0") else PositionSide.LONG
+                
+                # Take absolute value of amount since we determine side by sign
+                amount = abs(amount)
+                
                 pos_key = self._perpetual_trading.position_key(trading_pair, position_side)
-
+                
                 if amount != s_decimal_0:
                     entry_price = Decimal(str(position.get("entry_price", "0")))
                     unrealized_pnl = Decimal(str(position.get("pnl", "0")))
                     leverage = Decimal(str(position.get("effective_leverage", "1")))
-
+                    
                     position_instance = Position(
                         trading_pair=trading_pair,
                         position_side=position_side,
                         unrealized_pnl=unrealized_pnl,
                         entry_price=entry_price,
-                        amount=amount * (Decimal("-1.0") if position_side == PositionSide.SHORT else Decimal("1.0")),
+                        amount=amount,  # Use absolute amount here
                         leverage=leverage,
                     )
                     self._perpetual_trading.set_position(pos_key, position_instance)
+                    self.logger().info(f"Updated position: {trading_pair} {position_side} - Amount: {amount}, Entry: {entry_price}, PnL: {unrealized_pnl}")
                 else:
                     self._perpetual_trading.remove_position(pos_key)
-
+                    self.logger().info(f"Removed position: {trading_pair} {position_side}")
+            
             # Trigger balance update because Kraken doesn't have balance updates through the websocket
             safe_ensure_future(self._update_balances())
         except Exception as e:
@@ -1020,64 +1061,90 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _process_order_event_message(self, order_msg: Dict[str, Any]):
         """
-        Updates in-flight order and triggers cancellation or failure event if needed.
-        :param order_msg: The order event message payload
+        Process order event message from WebSocket.
+        :param order_msg: The order event message.
         """
-        self.logger().debug(f"Processing order event: {order_msg}")
-
-        # Check if this is a historical order update
-        if isinstance(order_msg, dict) and "order" in order_msg and isinstance(order_msg["order"], dict) and "order" in order_msg["order"]:
-            self.logger().debug("Processing historical order update")
-            return self._process_historical_order_event_message(order_msg["order"])
-
-        # Handle live order updates
-        if "order" not in order_msg:
-            self.logger().debug("No order data in message")
+        try:
+            if not isinstance(order_msg, dict):
+                self.logger().error(f"Unexpected order message format: {order_msg}")
+                return
+            
+            # Extract the actual order data from the message
+            actual_order_data = order_msg
+            
+            # Check if this is a formatted message with data field
+            if "data" in order_msg and isinstance(order_msg["data"], dict):
+                actual_order_data = order_msg["data"]
+                self.logger().debug(f"Extracted order data from formatted message: {actual_order_data}")
+            
+            # Check if this is a batch of orders
+            orders = []
+            if "orders" in actual_order_data:
+                orders = actual_order_data.get("orders", [])
+                self.logger().info(f"Processing {len(orders)} orders from order feed")
+            else:
+                # Single order message
+                orders = [actual_order_data]
+            
+            for order in orders:
+                self._process_single_order(order)
+                
+        except Exception as e:
+            self.logger().error(f"Error processing order event: {str(e)}", exc_info=True)
+            self.logger().error(f"Order message: {order_msg}")
+    
+    def _process_single_order(self, order_data: Dict[str, Any]):
+        """
+        Process a single order from WebSocket.
+        :param order_data: The order data.
+        """
+        # Skip if no client order ID
+        client_order_id = str(order_data.get("cli_ord_id", ""))
+        if not client_order_id:
+            self.logger().debug(f"No client order ID in order data: {order_data}")
             return
-
-        order_data = order_msg.get("order", {})
-        client_order_id = str(order_data.get("cliOrdId", ""))
-
+        
+        # Skip if order not found in tracker
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is None:
-            self.logger().debug(f"Order not found in tracker: {client_order_id}")
+            self.logger().debug(f"Order {client_order_id} not found in order tracker")
             return
-
+        
         # Get order status
-        order_status = order_data.get("status", "UNKNOWN")
-        self.logger().debug(f"Order status update - ID: {client_order_id}, Current Status: {tracked_order.current_state}, New Status: {order_status}")
-
+        order_status = order_data.get("status", "")
+        
+        # Map Kraken status to Hummingbot status
+        new_state = CONSTANTS.ORDER_STATE.get(order_status, None)
+        if new_state is None:
+            self.logger().warning(f"Unknown order status: {order_status}")
+            return
+        
+        # Get filled amount
+        filled_amount = Decimal(str(order_data.get("filled", "0")))
+        total_amount = Decimal(str(order_data.get("size", "0")))
+        
         # Get exchange order ID
-        exchange_order_id = str(order_data.get("orderId", ""))
-
+        exchange_order_id = str(order_data.get("order_id", ""))
+        
         # Get timestamp
-        timestamp = self.current_timestamp
-
+        timestamp = order_data.get("last_update_time", int(time.time() * 1000))
+        
+        self.logger().info(f"\nCreating order update:"
+                          f"\n  Client Order ID: {client_order_id}"
+                          f"\n  Exchange Order ID: {exchange_order_id}"
+                          f"\n  Status: {order_status}"
+                          f"\n  Filled Amount: {filled_amount}/{total_amount}"
+                          f"\n  New State: {new_state}")
+        
         order_update = OrderUpdate(
-            client_order_id=client_order_id,
-            exchange_order_id=exchange_order_id,
             trading_pair=tracked_order.trading_pair,
             update_timestamp=timestamp,
-            new_state=CONSTANTS.ORDER_STATE[order_status],
+            new_state=new_state,
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_order_id,
         )
-
-        self.logger().debug(
-            f"Creating order update:"
-            f"\n  Client Order ID: {client_order_id}"
-            f"\n  Exchange Order ID: {exchange_order_id}"
-            f"\n  Status: {order_status}"
-            f"\n  New State: {CONSTANTS.ORDER_STATE[order_status]}"
-        )
-
+        
         self._order_tracker.process_order_update(order_update)
-
-        self.logger().debug(
-            f"Order state after update:"
-            f"\n  New State: {tracked_order.current_state}"
-            f"\n  Is Done: {tracked_order.is_done}"
-            f"\n  Is Filled: {tracked_order.is_filled}"
-            f"\n  Is Cancelled: {tracked_order.is_cancelled}"
-        )
 
     def _process_historical_order_event_message(self, order_msg: Dict[str, Any]):
         """
@@ -1165,58 +1232,139 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
         self._order_tracker.process_order_update(order_update)
-# // ... existing code ...
 
     def _process_trade_event_message(self, trade_msg: Dict[str, Any]):
         """
-        Updates in-flight order and triggers order filled event for trade message received.
-        :param trade_msg: The trade event message payload
+        Process trade event message from WebSocket or REST API.
+        :param trade_msg: The trade event message.
         """
-        if not isinstance(trade_msg, dict):
-            self.logger().error(f"Unexpected trade message format: {trade_msg}")
-            return
-
+        try:
+            if not isinstance(trade_msg, dict):
+                self.logger().error(f"Unexpected trade message format: {trade_msg}")
+                return
+            
+            # Extract the actual trade data from the message
+            actual_trade_data = trade_msg
+            
+            # Check if this is a formatted message with data field
+            if "data" in trade_msg and isinstance(trade_msg["data"], dict):
+                actual_trade_data = trade_msg["data"]
+                self.logger().debug(f"Extracted trade data from formatted message: {actual_trade_data}")
+            
+            # Check if this is a live WebSocket message by looking for WebSocket-specific fields
+            is_ws_message = "feed" in actual_trade_data or "cli_ord_id" in actual_trade_data
+            
+            # Check if this is from a fills_snapshot
+            is_snapshot = actual_trade_data.get("feed") == "fills_snapshot"
+            
+            # Check if this is a fills feed message with multiple fills
+            if is_ws_message and "fills" in actual_trade_data:
+                fills = actual_trade_data.get("fills", [])
+                self.logger().info(f"Processing {len(fills)} fills from {'fills_snapshot' if is_snapshot else 'fills feed'}")
+                
+                for fill in fills:
+                    # Add source information to the fill
+                    if is_snapshot:
+                        fill["source"] = "fills_snapshot"
+                    
+                    # Check if this is an assignment fill
+                    if fill.get("fill_type") == "assignment" or fill.get("fill_type") == "assignee":
+                        self.logger().info(f"Processing {'historical' if is_snapshot else 'real-time'} assignment fill: {fill}")
+                        self._process_assignment_fill(fill)
+                    else:
+                        # Process regular fill
+                        self.logger().info(f"Processing regular fill: {fill}")
+                        self._process_single_trade(fill, is_ws_message=True)
+                return
+            
+            # Process single trade
+            self._process_single_trade(actual_trade_data, is_ws_message)
+            
+        except Exception as e:
+            self.logger().error(f"Error processing trade event: {str(e)}", exc_info=True)
+            self.logger().error(f"Trade message: {trade_msg}")
+    
+    def _process_single_trade(self, trade_data: Dict[str, Any], is_ws_message: bool = False):
+        """
+        Process a single trade from WebSocket or REST API.
+        :param trade_data: The trade data.
+        :param is_ws_message: Whether this is from WebSocket.
+        """
+        if is_ws_message:
+            self.logger().info(f"\n=== Processing Trade ===\nTrade data: {trade_data}")
+        
         # Handle both WebSocket (cli_ord_id) and REST (cliOrdId) formats
-        client_order_id = str(trade_msg.get("cli_ord_id") or trade_msg.get("cliOrdId", ""))
-        # self.logger().info(f"Processing trade event - Order ID: {client_order_id}")
-
+        client_order_id = str(trade_data.get("cli_ord_id") or trade_data.get("cliOrdId", ""))
+        if is_ws_message:
+            self.logger().info(f"Client Order ID: {client_order_id}")
+        
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
         if tracked_order is None:
-            # self.logger().debug(f"Order {client_order_id} not found in order tracker")
-            # self.logger().debug(f"Current orders in tracker: {self._order_tracker.all_fillable_orders}")
+            if is_ws_message:
+                self.logger().debug(f"Order {client_order_id} not found in order tracker")
+                self.logger().debug(f"Current orders in tracker: {list(self._order_tracker.all_fillable_orders.keys())}")
             return
-
-        # self.logger().info(f"Order before trade update - Order ID: {client_order_id}, State: {tracked_order.current_state}, Filled Amount: {tracked_order.executed_amount_base}/{tracked_order.amount}")
-
+        
+        if is_ws_message:
+            self.logger().info(
+                f"\nOrder details before trade update:"
+                f"\n  Order ID: {client_order_id}"
+                f"\n  State: {tracked_order.current_state}"
+                f"\n  Filled Amount: {tracked_order.executed_amount_base}/{tracked_order.amount}"
+            )
+        
         # Handle both WebSocket (fee_currency) and REST (feeCurrency) formats
-        fee_currency = trade_msg.get("fee_currency") or trade_msg.get("feeCurrency", "")
-        fee_paid = trade_msg.get("fee_paid") or trade_msg.get("fee", "0")
-
+        fee_currency = trade_data.get("fee_currency") or trade_data.get("feeCurrency", "")
+        fee_paid = trade_data.get("fee_paid") or trade_data.get("fee", "0")
+        
         # Remove any negative sign from fee currency and ensure it's not None
         fee_currency = fee_currency.replace("-", "") if fee_currency else ""
-
+        
+        # Get quote currency directly from the order
+        quote_currency = tracked_order.quote_asset
+        
+        # Process fees
+        fee_amount = Decimal(str(fee_paid))
+        flat_fees = []
+        
+        if fee_currency and fee_amount > Decimal("0"):
+            # Log the fee details for debugging
+            self.logger().info(f"Processing fee: {fee_amount} {fee_currency}")
+            flat_fees = [TokenAmount(amount=fee_amount, token=fee_currency)]
+        
+        # Create the fee object
         fee = TradeFeeBase.new_perpetual_fee(
             fee_schema=self.trade_fee_schema(),
             position_action=tracked_order.position,
-            percent_token=fee_currency,
-            flat_fees=[TokenAmount(amount=Decimal(str(fee_paid)), token=fee_currency)] if fee_currency else []
+            percent_token=quote_currency,
+            flat_fees=flat_fees,
         )
-
+        
         # Handle both WebSocket (qty) and REST (size) formats
-        fill_size = Decimal(str(trade_msg.get("qty") or trade_msg.get("size", "0")))
-        fill_price = Decimal(str(trade_msg.get("price", "0")))
+        fill_size = Decimal(str(trade_data.get("qty") or trade_data.get("size", "0")))
+        fill_price = Decimal(str(trade_data.get("price", "0")))
         fill_quote_amount = fill_size * fill_price
-
+        
         # Handle both WebSocket (fill_id, order_id) and REST (fillId, orderId) formats
-        trade_id = str(trade_msg.get("fill_id") or trade_msg.get("fillId", ""))
-        exchange_order_id = str(trade_msg.get("order_id") or trade_msg.get("orderId", ""))
-
+        trade_id = str(trade_data.get("fill_id") or trade_data.get("fillId", ""))
+        exchange_order_id = str(trade_data.get("order_id") or trade_data.get("orderId", ""))
+        
         # Handle both WebSocket (time) and REST (fillTime) formats
-        timestamp = trade_msg.get("time")
+        timestamp = trade_data.get("time")
         if timestamp is None:
-            fill_time = trade_msg.get("fillTime", "1970-01-01T00:00:00.000Z")
+            fill_time = trade_data.get("fillTime", "1970-01-01T00:00:00.000Z")
             timestamp = int(datetime.strptime(fill_time, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp() * 1e3)
-
+        
+        if is_ws_message:
+            self.logger().info(
+                f"\nProcessed trade details:"
+                f"\n  Trade ID: {trade_id}"
+                f"\n  Exchange Order ID: {exchange_order_id}"
+                f"\n  Fill Size: {fill_size}"
+                f"\n  Fill Price: {fill_price}"
+                f"\n  Fee: {fee_paid} {fee_currency}"
+            )
+        
         trade_update = TradeUpdate(
             trade_id=trade_id,
             client_order_id=client_order_id,
@@ -1226,25 +1374,10 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             fill_base_amount=fill_size,
             fill_quote_amount=fill_quote_amount,
             fill_price=fill_price,
-            fill_timestamp=int(timestamp) * 1e-3,  # Convert milliseconds to seconds
+            fill_timestamp=timestamp,
         )
-
+        
         self._order_tracker.process_trade_update(trade_update)
-
-        # After processing the trade update, check if the order is completely filled
-        if tracked_order.is_done and tracked_order.is_filled:
-            # Create an order update to set the state to FILLED
-            order_update = OrderUpdate(
-                client_order_id=client_order_id,
-                exchange_order_id=exchange_order_id,
-                trading_pair=tracked_order.trading_pair,
-                update_timestamp=self.current_timestamp,
-                new_state=CONSTANTS.ORDER_STATE["FILLED"]
-            )
-            self._order_tracker.process_order_update(order_update)
-
-        # self.logger().info(f"Order after trade update - Order ID: {client_order_id}, State: {tracked_order.current_state}, Filled Amount: {tracked_order.executed_amount_base}/{tracked_order.amount}, Is Done: {tracked_order.is_done}, Is Filled: {tracked_order.is_filled}, Is Cancelled: {tracked_order.is_cancelled}")
-        # self.logger().info(f"Order completely filled event is set: {tracked_order.completely_filled_event.is_set()}")
 
     def _parse_trade_update(self, trade_msg: Dict, tracked_order: InFlightOrder) -> TradeUpdate:
         """Parse trade update message from the exchange."""
@@ -1260,12 +1393,21 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                                or tracked_order.trade_type is TradeType.SELL and not trade_msg["buy"])
                            else PositionAction.CLOSE)
 
-        flat_fees = [] if fee_amount == Decimal("0") else [TokenAmount(amount=fee_amount, token=fee_currency)]
+        # Get quote currency directly from the order
+        quote_currency = tracked_order.quote_asset
+        
+        # Process fees
+        flat_fees = []
+        if fee_currency and fee_amount > Decimal("0"):
+            # Log the fee details
+            self.logger().info(f"Processing fee in trade update: {fee_amount} {fee_currency}")
+            flat_fees = [TokenAmount(amount=fee_amount, token=fee_currency)]
 
+        # Create the fee object
         fee = TradeFeeBase.new_perpetual_fee(
             fee_schema=self.trade_fee_schema(),
             position_action=position_action,
-            percent_token=fee_currency,
+            percent_token=quote_currency,
             flat_fees=flat_fees,
         )
 
@@ -1291,38 +1433,50 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         Process wallet balance update message.
         :param wallet_msg: The wallet balance update message.
         """
-        # Extract flex_futures data from either snapshot or regular update
-        flex_futures_data = None
-        if wallet_msg.get("feed") == "balances_snapshot":
-            flex_futures_data = wallet_msg.get("flex_futures", {})
-        elif "flex_futures" in wallet_msg:
-            flex_futures_data = wallet_msg["flex_futures"]
-
-        if flex_futures_data is None:
-            self.logger().debug("No flex_futures data in wallet message")
-            return
-
-        # Process currencies in flex_futures account
-        currencies = flex_futures_data.get("currencies", {})
-        for currency, details in currencies.items():
-            # Get quantity and collateral value
-            quantity = details.get("quantity", 0)
-            collateral_value = details.get("collateral_value", 0)
-
-            # Convert values to Decimal
-            available_balance = Decimal(str(quantity))
-            total_balance = Decimal(str(quantity))
-
-            # Update balance for this currency
-            self._account_balances[currency] = total_balance
-            self._account_available_balances[currency] = available_balance
-
-            self.logger().debug(f"Updated {currency} balance - Total: {total_balance}, Available: {available_balance}")
-
-        # Log portfolio summary
-        portfolio_value = Decimal(str(flex_futures_data.get("portfolio_value", 0)))
-        collateral_value = Decimal(str(flex_futures_data.get("collateral_value", 0)))
-        self.logger().debug(f"Portfolio Value: {portfolio_value}, Collateral Value: {collateral_value}")
+        try:
+            # Extract flex_futures data from the message
+            flex_futures_data = None
+            
+            # Check if this is a direct message or nested in data field
+            if "flex_futures" in wallet_msg:
+                flex_futures_data = wallet_msg["flex_futures"]
+            elif "data" in wallet_msg and isinstance(wallet_msg["data"], dict):
+                data = wallet_msg["data"]
+                if "flex_futures" in data:
+                    flex_futures_data = data["flex_futures"]
+                elif "feed" in data and data["feed"] == "balances":
+                    flex_futures_data = data.get("flex_futures", {})
+            
+            if flex_futures_data is None:
+                self.logger().debug(f"No flex_futures data in wallet message: {wallet_msg}")
+                return
+            
+            # Process currencies in flex_futures account
+            currencies = flex_futures_data.get("currencies", {})
+            for currency, details in currencies.items():
+                # Get quantity and collateral value
+                quantity = details.get("quantity", 0)
+                collateral_value = details.get("collateral_value", 0)
+                
+                # Convert values to Decimal
+                available_balance = Decimal(str(quantity))
+                total_balance = Decimal(str(quantity))
+                
+                # Update balance for this currency
+                self._account_balances[currency] = total_balance
+                self._account_available_balances[currency] = available_balance
+                
+                # self.logger().debug(f"Updated {currency} balance - Total: {total_balance}, Available: {available_balance}")
+            
+            # Log portfolio summary
+            portfolio_value = Decimal(str(flex_futures_data.get("portfolio_value", 0)))
+            collateral_value = Decimal(str(flex_futures_data.get("collateral_value", 0)))
+            self._total_collateral_value = collateral_value
+            # self.logger().info(f"Portfolio Value: {portfolio_value}, Collateral Value: {collateral_value}")
+            
+        except Exception as e:
+            self.logger().error(f"Error processing wallet event: {str(e)}", exc_info=True)
+            self.logger().error(f"Wallet message: {wallet_msg}")
 
     async def _get_max_order_size(self, symbol: str) -> Decimal:
         """
@@ -1332,9 +1486,11 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         """
         try:
             params = {
-                "orderType": "mkt",
+                "orderType": "mkt",  # Using "limit" instead of "lmt" for production environment
                 "symbol": symbol,
             }
+
+            self.logger().info(f"\n=== Getting Max Order Size ===\nSymbol: {symbol}\nParams: {params}")
 
             max_order_info = await self._api_get(
                 path_url=CONSTANTS.MAX_ORDER_SIZE_ENDPOINT,
@@ -1342,6 +1498,8 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                 method=RESTMethod.GET,
                 is_auth_required=True
             )
+
+            self.logger().info(f"Max order size response: {max_order_info}")
 
             if max_order_info.get("result") == "success":
                 # Get raw values and handle None cases
@@ -1352,18 +1510,25 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                 max_buy_size = Decimal(str(max_buy_size_raw)) if max_buy_size_raw is not None else Decimal("0")
                 max_sell_size = Decimal(str(max_sell_size_raw)) if max_sell_size_raw is not None else Decimal("0")
 
+                self.logger().info(f"Parsed sizes - Buy: {max_buy_size}, Sell: {max_sell_size}")
+
                 # If both are 0, return 0
                 if max_buy_size == Decimal("0") and max_sell_size == Decimal("0"):
+                    self.logger().info("Both buy and sell sizes are 0, returning 0")
                     return Decimal("0")
 
                 # If one is 0, return the other
                 if max_buy_size == Decimal("0"):
+                    self.logger().info(f"Buy size is 0, returning sell size: {max_sell_size}")
                     return max_sell_size
                 if max_sell_size == Decimal("0"):
+                    self.logger().info(f"Sell size is 0, returning buy size: {max_buy_size}")
                     return max_buy_size
 
                 # If both have values, return the minimum
-                return min(max_buy_size, max_sell_size)
+                result = min(max_buy_size, max_sell_size)
+                self.logger().info(f"Returning minimum of buy/sell sizes: {result}")
+                return result
             else:
                 error_msg = max_order_info.get("error", "Unknown error")
                 self.logger().warning(f"Error getting max order size for {symbol}: {error_msg}")
@@ -1373,52 +1538,117 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             return Decimal("0")
 
     async def _format_trading_rules(self, instruments_info: List[Dict[str, Any]]) -> List[TradingRule]:
-        """
-        Format the trading rules response from the exchange into TradingRule instances.
-        :param instruments_info: The list of instruments information from the exchange
-        :returns: A list of TradingRule instances
-        """
-
+        """Format the trading rules response into TradingRule instances"""
+        self.logger().info("\n=== Formatting Trading Rules ===")
         trading_rules = {}
         symbol_map = await self.trading_pair_symbol_map()
-
+        self.logger().info(f"Symbol map: {symbol_map}")
+        
         # Process only the tradeable instruments that are in our symbol map
         valid_instruments = [
             instrument for instrument in instruments_info
             if instrument.get("symbol").startswith("PF_") and instrument.get("symbol").endswith("USD") and instrument["symbol"] in symbol_map
         ]
+        self.logger().info(f"Found {len(valid_instruments)} valid instruments")
+        
+        # Get ticker data for all instruments in one call
+        ticker_tasks = []
+        for instrument in valid_instruments:
+            params = {"symbol": instrument["symbol"]}
+            ticker_tasks.append(
+                self._api_get(
+                    path_url=CONSTANTS.TICKER_PRICE_ENDPOINT,
+                    params=params,
+                    limit_id=web_utils.PUBLIC_LIMIT_ID,
+                )
+            )
+        ticker_responses = await safe_gather(*ticker_tasks, return_exceptions=True)
+        self.logger().info(f"Received {len(ticker_responses)} ticker responses")
 
+        # Create a map of symbol to ticker data
+        ticker_map = {}
+        for instrument, ticker_response in zip(valid_instruments, ticker_responses):
+            exchange_symbol = instrument["symbol"]
+            self.logger().debug(f"Processing ticker for {exchange_symbol}")
+            
+            if not isinstance(ticker_response, Exception) and ticker_response.get("result") == "success":
+                tickers = ticker_response.get("tickers", [])
+                self.logger().debug(f"Response contains {len(tickers)} tickers")
+                
+                # Find the ticker that matches our instrument symbol
+                matching_ticker = None
+                for ticker in tickers:
+                    ticker_symbol = ticker.get("symbol")
+                    if ticker_symbol == exchange_symbol:
+                        matching_ticker = ticker
+                        self.logger().debug(f"Found matching ticker: {ticker}")
+                        break
+                
+                if matching_ticker:
+                    ticker_map[exchange_symbol] = matching_ticker
+                else:
+                    self.logger().warning(f"No matching ticker found for {exchange_symbol}")
+            else:
+                error = str(ticker_response) if isinstance(ticker_response, Exception) else ticker_response.get("error", "Unknown error")
+                self.logger().error(f"Failed to get ticker for {exchange_symbol}: {error}")
 
         for instrument in valid_instruments:
             try:
                 exchange_symbol = instrument["symbol"]
                 trading_pair = symbol_map[exchange_symbol]
-
-                # Skip if we already have a trading rule for this pair
-                if trading_pair in trading_rules:
-                    self._logger.info(f"Trading rule already exists for {trading_pair}, skipping...")
-                    continue
+                self.logger().info(f"\nProcessing trading rules for {trading_pair} ({exchange_symbol})")
 
                 # Calculate min_order_size based on contractValueTradePrecision
                 precision_str = str(instrument["contractValueTradePrecision"])
                 try:
                     precision = int(float(precision_str))  # Handles both int and float strings
                 except ValueError:
-                    self._logger.error(f"Error parsing precision for {exchange_symbol}: {precision_str}")
+                    self.logger().error(f"Error parsing precision for {exchange_symbol}: {precision_str}")
                     continue
 
                 min_order_size = Decimal(str("1" + "0" * abs(precision))) if precision < 0 else Decimal(
                     ("0." + "0" * (precision - 1) + "1") if precision > 0 else "1")
+                self.logger().info(f"Calculated min order size: {min_order_size}")
 
                 # Get max position size from instrument info
                 max_position_size = Decimal(str(instrument.get("maxPositionSize", "0")))
+                self.logger().info(f"Max position size from instrument: {max_position_size}")
 
-                # Get max order size from API
-                max_order_size = await self._get_max_order_size(exchange_symbol)
+                # Calculate max order size based on ticker data and initial margin
+                ticker_data = ticker_map.get(exchange_symbol)
+                if ticker_data:
+                    # Get best bid/ask prices for this specific trading pair
+                    best_bid = Decimal(str(ticker_data.get("bid", "0")))
+                    best_ask = Decimal(str(ticker_data.get("ask", "0")))
+                    mid_price = (best_bid + best_ask) / Decimal("2")
+                    self.logger().info(f"Price data - Bid: {best_bid}, Ask: {best_ask}, Mid: {mid_price}")
 
-                # If max_order_size is 0 (API error or limit not available), fallback to max_position_size
-                if max_order_size == Decimal("0"):
-                    self._logger.info(f"Using max position size as fallback: {max_position_size}")
+                    # Get initial margin requirement from the instrument data
+                    margin_levels = instrument.get("marginLevels", [])
+                    if margin_levels:
+                        # Use the first level's margin requirement (smallest position size)
+                        initial_margin = Decimal(str(margin_levels[0].get("initialMargin", "0.02")))
+                        self.logger().info(f"Using initial margin {initial_margin} from margin levels")
+                    else:
+                        # Fallback to default margin if no levels defined
+                        initial_margin = Decimal("0.02")  # Default to 2% if no margin levels found
+                        self.logger().warning(f"No margin levels found for {trading_pair}, using default {initial_margin}")
+
+                    # Calculate max order size using this pair's specific prices
+                    if mid_price > 0 and initial_margin > 0:
+                        max_order_size = (self._total_collateral_value / mid_price) / initial_margin
+                        # Apply a safety factor (e.g., 0.99) to account for price movements
+                        max_order_size = max_order_size * Decimal("0.99")
+                        self.logger().info(f"Calculated max order size: {max_order_size}")
+                    else:
+                        self.logger().warning(
+                            f"Invalid price or margin for {trading_pair}. Using max position size."
+                            f"\n    Mid price: {mid_price}"
+                            f"\n    Initial margin: {initial_margin}"
+                        )
+                        max_order_size = max_position_size
+                else:
+                    self.logger().warning(f"No ticker data available for {exchange_symbol}, using max position size")
                     max_order_size = max_position_size
 
                 # Convert numeric values directly to Decimal
@@ -1441,6 +1671,11 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                 )
 
                 trading_rules[trading_pair] = trading_rule
+                self.logger().info(f"\nCreated trading rule for {trading_pair}:"
+                                 f"\n  Min Order Size: {trading_rule.min_order_size}"
+                                 f"\n  Max Order Size: {trading_rule.max_order_size}"
+                                 f"\n  Min Price Increment: {trading_rule.min_price_increment}"
+                                 f"\n  Min Base Amount Increment: {trading_rule.min_base_amount_increment}")
 
             except Exception as e:
                 self.logger().error(f"Error parsing trading rule for instrument: {instrument}. Error: {str(e)}")
@@ -1452,12 +1687,27 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         """Initialize trading pair symbols from exchange info."""
         try:
             mapping = bidict()
+            # seen_trading_pairs = {}  # Track trading pairs and their exchange symbols
 
             # exchange_info is already a list of instruments
             for symbol_data in filter(kraken_utils.is_exchange_information_valid, exchange_info):
                 exchange_symbol = symbol_data["symbol"]
-                # For PF_XBTUSD, we want to extract XBT and USD
+                # self.logger().debug(f"Processing exchange symbol: {exchange_symbol}")
+
+                # Skip if not a perpetual futures symbol
+                if not exchange_symbol.startswith("PF_") or not exchange_symbol.endswith("USD"):
+                    # self.logger().debug(f"Skipping non-perpetual futures symbol: {exchange_symbol}")
+                    continue
+
+                # Extract base currency with special handling for USDT and T
                 base = exchange_symbol[3:].replace("USD", "")  # Remove PF_ prefix and USD suffix
+                
+                # Special handling for USDT vs T
+                if exchange_symbol == "PF_USDTUSD":
+                    base = "USDT"
+                elif exchange_symbol == "PF_TUSD":
+                    base = "T"
+                
                 quote = "USD"
 
                 # Convert XBT to BTC if needed
@@ -1465,9 +1715,15 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                     base = "BTC"
 
                 trading_pair = combine_to_hb_trading_pair(base, quote)
-                mapping[exchange_symbol] = trading_pair
+                # self.logger().debug(f"Converted to trading pair: {trading_pair}")
 
+                # Add new mapping
+                mapping[exchange_symbol] = trading_pair
+                # self.logger().debug(f"Added mapping: {exchange_symbol} -> {trading_pair}")
+
+            # self.logger().info(f"Initialized {len(mapping)} trading pair symbols")
             self._set_trading_pair_symbol_map(mapping)
+
         except Exception as e:
             self.logger().error(f"Error initializing trading pair symbols: {str(e)}", exc_info=True)
             raise
@@ -1493,16 +1749,43 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         # self.logger().info(f"Could not resolve the exchange symbols {new_exchange_symbol} and {current_exchange_symbol}")
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
-        exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        params = {"symbol": exchange_symbol}
+        """
+        Fetches the last traded price from the exchange API for the specified trading pair.
+        :param trading_pair: The trading pair to fetch the price for
+        :return: The last traded price
+        """
+        try:
+            exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
 
-        resp_json = await self._api_get(
-            path_url=CONSTANTS.TICKER_PRICE_ENDPOINT,
-            params=params,
-        )
+            resp_json = await self._api_get(
+                path_url=CONSTANTS.TICKER_PRICE_ENDPOINT,
+                limit_id=web_utils.PUBLIC_LIMIT_ID,
+            )
 
-        price = float(resp_json["tickers"]["last"])
-        return price
+            if resp_json.get("result") != "success":
+                raise IOError(f"Error fetching ticker price: {resp_json.get('error', 'Unknown error')}")
+
+            tickers = resp_json.get("tickers", [])
+            if not tickers:
+                raise IOError(f"No ticker data found for {trading_pair}")
+
+            # Find the ticker for our symbol
+            ticker = next((t for t in tickers if t.get("symbol") == exchange_symbol), None)
+            if not ticker:
+                raise IOError(f"No ticker found for symbol {exchange_symbol}")
+
+            if "last" not in ticker:
+                raise IOError(f"Last price not found in ticker data for {trading_pair}")
+
+            return float(ticker["last"])
+
+        except Exception as e:
+            self.logger().network(
+                f"Error getting last traded price for {trading_pair}: {str(e)}",
+                exc_info=True,
+                app_warning_msg=f"Error getting last traded price for {trading_pair}. Check API key and network connection."
+            )
+            raise
 
     async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
@@ -1541,8 +1824,9 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         try:
             response = await self._api_get(
                 path_url=CONSTANTS.HISTORICAL_FUNDING_RATES_ENDPOINT,
-                params={"symbol": exchange_symbol},  # Removed count parameter since it doesn't work
-                is_auth_required=False
+                params={"symbol": exchange_symbol},
+                is_auth_required=False,
+                limit_id=web_utils.PUBLIC_LIMIT_ID,
             )
 
             rates = response.get("rates", [])
@@ -1605,14 +1889,16 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             )
         return response
 
+
     def _get_position_idx(self, trade_type: TradeType, position_action: PositionAction = None) -> int:
         """
         Returns the position index for the given trade type and position action.
         Since Kraken only supports one-way positions, it always returns 0.
         """
+        if position_action == PositionAction.NIL:
+            raise NotImplementedError(f"Invalid position action {position_action}. Must be one of {[PositionAction.OPEN, PositionAction.CLOSE]}")
         if trade_type not in [TradeType.BUY, TradeType.SELL]:
             raise NotImplementedError(f"Unsupported trade type {trade_type}")
-            raise NotImplementedError(f"Unsupported position action {position_action}")
         return 0  # Kraken only supports one-way positions
 
     async def exchange_symbol_associated_to_pair(self, trading_pair: str) -> str:
@@ -1801,5 +2087,117 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             # self.logger().info(f"Waiting for: {', '.join(not_ready)}")
 
         return status_d
+
+    def _process_assignment_fill(self, fill: Dict[str, Any]) -> None:
+        """
+        Process an assignment fill event. This method extracts and formats the assignment information
+        for use in strategies.
+
+        :param fill: The assignment fill data from the WebSocket feed
+        """
+        try:
+            # Extract basic fill information
+            instrument = fill["instrument"]
+            timestamp_ms = fill["time"]  # Timestamp in milliseconds
+            price = Decimal(str(fill["price"]))
+            quantity = Decimal(str(fill["qty"]))
+            is_buy = fill["buy"]
+            fill_id = fill["fill_id"]
+            order_id = fill["order_id"]
+            
+            # Check if this is from a historical snapshot or real-time
+            is_historical = "source" in fill and fill.get("source") == "fills_snapshot"
+            
+            # Convert instrument to trading pair
+            trading_pair = kraken_utils.convert_from_exchange_trading_pair(instrument)
+            
+            # Convert timestamp from milliseconds to seconds for datetime
+            timestamp_sec = timestamp_ms / 1000.0 if timestamp_ms > 10000000000 else timestamp_ms
+            
+            # Format timestamp for display
+            try:
+                formatted_time = datetime.fromtimestamp(timestamp_sec).strftime('%Y-%m-%d %H:%M:%S')
+            except (ValueError, OverflowError):
+                self.logger().warning(f"Invalid timestamp value: {timestamp_ms}, using current time instead")
+                formatted_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # Create assignment info dictionary
+            assignment_info = {
+                "trading_pair": trading_pair,
+                "timestamp": timestamp_ms,
+                "price": price,
+                "quantity": quantity,
+                "side": "BUY" if is_buy else "SELL",
+                "fill_id": fill_id,
+                "order_id": order_id,
+                "position_side": PositionSide.LONG if is_buy else PositionSide.SHORT,
+                "is_historical": is_historical
+            }
+
+            # Log with appropriate prefix
+            prefix = "Historical" if is_historical else "Real-time"
+            self.logger().info(
+                f"\n=== {prefix} Assignment Fill Received ==="
+                f"\nTrading Pair: {trading_pair}"
+                f"\nSide: {'BUY' if is_buy else 'SELL'}"
+                f"\nQuantity: {quantity}"
+                f"\nPrice: {price}"
+                f"\nTimestamp: {formatted_time}"
+                f"\nFill ID: {fill_id}"
+                f"\nOrder ID: {order_id}"
+            )
+
+            # Only emit event for real-time fills, not historical ones
+            if not is_historical:
+                self.logger().info("Emitting assignment fill event")
+                # Create the event object once
+                event = AssignmentFillEvent(
+                    timestamp=self.current_timestamp,
+                    trading_pair=trading_pair,
+                    price=price,
+                    amount=quantity,
+                    position_side=PositionSide.LONG if is_buy else PositionSide.SHORT,
+                    fill_id=fill_id,
+                    order_id=order_id,
+                )
+                # Only emit the MarketEvent enum event
+                try:
+                    self.trigger_event(MarketEvent.AssignmentFill, event)
+                except Exception as e:
+                    self.logger().error(f"Error triggering assignment fill event: {e}", exc_info=True)
+                    
+                # # For backward compatibility, notify listeners directly
+                # for listener in self._event_listeners.get("assignment_fill", []):
+                #     try:
+                #         listener(event)
+                #     except Exception as e:
+                #         self.logger().error(f"Error in assignment fill listener: {e}", exc_info=True)
+            else:
+                self.logger().info("Historical assignment fill - not emitting event")
+                
+        except Exception as e:
+            self.logger().error(f"Error processing assignment fill: {str(e)}", exc_info=True)
+            self.logger().error(f"Assignment fill data: {fill}")
+
+    def _split_trading_pair(self, trading_pair: str) -> Tuple[str, str]:
+        """
+        Extract the base and quote currency from a trading pair.
+        :param trading_pair: A trading pair in the format BASE-QUOTE
+        :return: A tuple of (base_currency, quote_currency)
+        """
+        try:
+            base, quote = trading_pair.split("-")
+            return base, quote
+        except ValueError:
+            # If there's no hyphen, try to infer base and quote from known patterns
+            # For BTC/USD trading pairs, Kraken often uses XBTUSD format
+            if trading_pair.endswith("USD"):
+                if trading_pair.startswith("XBT"):
+                    return "BTC", "USD"
+                else:
+                    # Assume the last 3 characters are the quote currency
+                    return trading_pair[:-3], "USD"
+            self.logger().warning(f"Could not split trading pair {trading_pair} into base and quote")
+            return trading_pair, trading_pair  # Return as fallback
 
 

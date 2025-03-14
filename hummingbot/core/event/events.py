@@ -27,6 +27,7 @@ class MarketEvent(Enum):
     SellOrderCreated = 201
     FundingPaymentCompleted = 202
     FundingInfo = 203
+    AssignmentFill = 204  # Added for assignment fills from perpetual exchanges
     RangePositionLiquidityAdded = 300
     RangePositionLiquidityRemoved = 301
     RangePositionUpdate = 302
@@ -349,3 +350,16 @@ class PositionUpdateEvent:
     entry_price: Decimal
     amount: Decimal
     leverage: Decimal
+
+
+class AssignmentFillEvent(NamedTuple):
+    """
+    Event triggered when an assignment fill is received from the exchange.
+    """
+    timestamp: float
+    trading_pair: str
+    position_side: PositionSide
+    price: Decimal
+    amount: Decimal
+    fill_id: str
+    order_id: str

@@ -15,10 +15,14 @@ from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecut
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.executors.rebalance_executor.data_types import RebalanceExecutorConfig
+from hummingbot.strategy_v2.executors.rebalance_executor.rebalance_executor import RebalanceExecutor
 from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig
 from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExecutor
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
+from hummingbot.strategy_v2.executors.assignment_executor.data_types import AssignmentExecutorConfig
+from hummingbot.strategy_v2.executors.assignment_executor.assignment_executor import AssignmentExecutor
 from hummingbot.strategy_v2.models.executor_actions import (
     CreateExecutorAction,
     ExecutorAction,
@@ -117,11 +121,19 @@ class ExecutorOrchestrator:
         controller_id = action.controller_id
         executor_config = action.executor_config
 
+        # Add debug logging
+        self.logger().info(f"Creating executor with config type: {type(executor_config)}")
+        self.logger().info(f"Config details: {executor_config}")
+
         # For now, we replace the controller ID in the executor config with the actual controller object to mantain
         # compa
         executor_config.controller_id = controller_id
 
-        if isinstance(executor_config, PositionExecutorConfig):
+        if isinstance(executor_config, AssignmentExecutorConfig):
+            self.logger().info("Creating AssignmentExecutor")
+            executor = AssignmentExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif isinstance(executor_config, PositionExecutorConfig):
+            self.logger().info("Creating PositionExecutor")
             executor = PositionExecutor(self.strategy, executor_config, self.executors_update_interval)
         elif isinstance(executor_config, GridExecutorConfig):
             executor = GridExecutor(self.strategy, executor_config, self.executors_update_interval)
@@ -134,7 +146,8 @@ class ExecutorOrchestrator:
         elif isinstance(executor_config, XEMMExecutorConfig):
             executor = XEMMExecutor(self.strategy, executor_config, self.executors_update_interval)
         else:
-            raise ValueError("Unsupported executor config type")
+            self.logger().error(f"Unsupported executor config type: {type(executor_config)}")
+            raise ValueError(f"Unsupported executor config type: {type(executor_config)}")
 
         executor.start()
         self.active_executors[controller_id].append(executor)

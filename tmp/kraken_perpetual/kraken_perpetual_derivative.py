@@ -556,13 +556,13 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                     if total_balance > Decimal("0"):
                         self._account_balances[normalized_currency] = total_balance
                         self._account_available_balances[normalized_currency] = available_balance
-                        self.logger().debug(f"Updated {normalized_currency} balance - Total: {total_balance}, Available: {available_balance}")
+                        # self.logger().debug(f"Updated {normalized_currency} balance - Total: {total_balance}, Available: {available_balance}")
 
             # Log portfolio summary if available
             if flex_account:
                 portfolio_value = Decimal(str(flex_account.get("portfolioValue", "0")))
                 collateral_value = Decimal(str(flex_account.get("collateralValue", "0")))
-                self.logger().debug(f"Portfolio Value: {portfolio_value}, Collateral Value: {collateral_value}")
+                # self.logger().debug(f"Portfolio Value: {portfolio_value}, Collateral Value: {collateral_value}")
         except Exception as e:
             self.logger().error(f"Error updating balances: {str(e)}", exc_info=True)
             raise
