@@ -1248,10 +1248,11 @@ class KrakenPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualD
         print(f"\nCollateral tokens:")
         print(f"Buy collateral token: {buy_collateral_token}")
         print(f"Sell collateral token: {sell_collateral_token}")
-        print(f"Expected quote asset: {self.quote_asset}")
+        print(f"Expected collateral asset: USD")
 
-        self.assertEqual(self.quote_asset, buy_collateral_token)
-        self.assertEqual(self.quote_asset, sell_collateral_token)
+        # For Kraken Perpetual, we use USD as the standard collateral token for all trading pairs
+        self.assertEqual("USD", buy_collateral_token)
+        self.assertEqual("USD", sell_collateral_token)
 
     @aioresponses()
     def test_resolving_trading_pair_symbol_duplicates_on_trading_rules_update_first_is_good(self, mock_api):
@@ -2274,3 +2275,38 @@ class KrakenPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualD
         self.async_run_with_timeout(coroutine=self.exchange._update_trading_rules())
 
         self.assertEqual(0, len(self.exchange._trading_rules))
+
+    def test_get_balance_with_usd_collateral(self):
+        """Test that get_balance returns USD balance for any currency in trading pairs."""
+        self._simulate_trading_rules_initialized()
+        
+        # Configure balances - only add USD balance
+        self.exchange._account_balances = {
+            "USD": Decimal("1000"),  # Only USD balance
+            "ETH": Decimal("0")      # Zero ETH balance
+        }
+        self.exchange._account_available_balances = {
+            "USD": Decimal("900"),   # Available USD balance
+            "ETH": Decimal("0")      # Zero ETH available balance
+        }
+        
+        # Test currencies directly
+        usd_balance = self.exchange.get_balance("USD")
+        eth_balance = self.exchange.get_balance("ETH")
+        
+        self.assertEqual(Decimal("1000"), usd_balance)
+        self.assertEqual(Decimal("0"), eth_balance)  # Direct balance check shows 0
+        
+        # Test base currency in trading pair 
+        # This should return USD balance since we're using USD as collateral
+        btc_balance = self.exchange.get_balance("BTC")
+        self.assertEqual(Decimal("1000"), btc_balance)  # Should return USD balance
+        
+        # Test available balance
+        usd_available = self.exchange.get_available_balance("USD")
+        btc_available = self.exchange.get_available_balance("BTC")
+        eth_available = self.exchange.get_available_balance("ETH")
+        
+        self.assertEqual(Decimal("900"), usd_available)
+        self.assertEqual(Decimal("900"), btc_available)  # Should return USD available balance
+        self.assertEqual(Decimal("0"), eth_available)    # Direct balance check shows 0

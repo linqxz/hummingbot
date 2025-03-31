@@ -112,10 +112,10 @@ ORDER_TYPE_MAP = {
     OrderType.LIMIT: "lmt",            # A limit order
     OrderType.MARKET: "mkt",           # An immediate-or-cancel order with 1% price protection
     OrderType.LIMIT_MAKER: "post",     # A post-only limit order
-    # OrderType.STOP_LOSS: "stp",                      # A stop order
+    OrderType.STOP_LOSS: "stp",                      # A stop order
     # OrderType.TAKE_PROFIT: "take_profit",     # A take profit order
     # OrderType.IOC: "ioc",     # A take profit order                    # An immediate-or-cancel order
-    # OrderType.TRAILING_STOP:"trailing_stop"   # A trailing stop order
+    OrderType.TRAILING_STOP: "trailing_stop"   # A trailing stop order
 }
 
 # Order State Mapping

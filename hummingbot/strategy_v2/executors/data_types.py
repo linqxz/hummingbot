@@ -13,6 +13,25 @@ class ExecutorConfigBase(BaseModel):
     type: str
     timestamp: float
     controller_id: str = "main"
+    
+    # Registry to keep track of subclass types
+    _config_types = {}
+    
+    def __init_subclass__(cls, **kwargs):
+        """
+        Register each subclass with a unique identifier.
+        This helps with proper type identification during isinstance checks.
+        """
+        super().__init_subclass__(**kwargs)
+        ExecutorConfigBase._config_types[cls.__name__] = cls
+        # Ensure each class has its own unique type identifier
+        if not hasattr(cls, 'type') or cls.type == "":
+            cls.type = cls.__name__.lower()
+    
+    @classmethod
+    def get_config_type(cls, type_name):
+        """Get a config class by its type name."""
+        return cls._config_types.get(type_name)
 
     @validator('id', pre=True, always=True)
     def set_id(cls, v, values):

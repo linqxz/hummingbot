@@ -23,6 +23,8 @@ from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecut
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
 from hummingbot.strategy_v2.executors.assignment_executor.data_types import AssignmentExecutorConfig
 from hummingbot.strategy_v2.executors.assignment_executor.assignment_executor import AssignmentExecutor
+from hummingbot.strategy_v2.executors.assignment_adapter_executor.data_types import AssignmentAdapterExecutorConfig
+from hummingbot.strategy_v2.executors.assignment_adapter_executor.assignment_adapter_executor import AssignmentAdapterExecutor
 from hummingbot.strategy_v2.models.executor_actions import (
     CreateExecutorAction,
     ExecutorAction,
@@ -129,8 +131,33 @@ class ExecutorOrchestrator:
         # compa
         executor_config.controller_id = controller_id
 
-        if isinstance(executor_config, AssignmentExecutorConfig):
-            self.logger().info("Creating AssignmentExecutor")
+        # FIX: Priority decision - use the type field first, then fallback to class check
+        # This solves the problem of AssignmentExecutorConfig instances with type='position_executor'
+        if type_property == "position_executor":
+            # self.logger().info("Creating PositionExecutor based on type field (not class type)")
+            executor = PositionExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif type_property == "assignment_executor":
+            # self.logger().info("Creating AssignmentExecutor based on type field (not class type)")
+            executor = AssignmentExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif type_property == "assignment_adapter_executor":
+            # self.logger().info("Creating AssignmentAdapterExecutor based on type field (not class type)")
+            executor = AssignmentAdapterExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif type_property == "grid_executor":
+            executor = GridExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif type_property == "dca_executor":
+            executor = DCAExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif type_property == "arbitrage_executor":
+            executor = ArbitrageExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif type_property == "twap_executor":
+            executor = TWAPExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif type_property == "xemm_executor":
+            executor = XEMMExecutor(self.strategy, executor_config, self.executors_update_interval)
+         # FALLBACK: If no type field or unknown value, use the class type
+        elif isinstance(executor_config, AssignmentAdapterExecutorConfig):
+            # self.logger().info("Creating AssignmentAdapterExecutor based on class type (fallback)")
+            executor = AssignmentAdapterExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif isinstance(executor_config, AssignmentExecutorConfig):
+            # self.logger().info("Creating AssignmentExecutor based on class type (fallback)")
             executor = AssignmentExecutor(self.strategy, executor_config, self.executors_update_interval)
         elif isinstance(executor_config, PositionExecutorConfig):
             self.logger().info("Creating PositionExecutor")

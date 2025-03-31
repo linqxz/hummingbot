@@ -201,7 +201,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         """
         :return a list of OrderType supported by this connector
         """
-        return [OrderType.LIMIT, OrderType.MARKET]
+        return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
     def get_buy_collateral_token(self, trading_pair: str) -> str:
         """Get the token used for collateral when buying."""
@@ -238,18 +238,37 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         """
-        Determines if an exception was raised because an order was not found during a status update.
-        :param status_update_exception: The exception that was raised.
-        :return: True if the exception indicates the order was not found, False otherwise.
+        Determines if the error received during order status update is caused by the order not being found.
+        :param status_update_exception: The error received during order status update.
+        :return: True if the error is caused by the order not being found. False otherwise.
         """
+        # The error format from the exchange is not properly documented in the API docs, thus
+        # this implementation is based on empirical observations.
         error_message = str(status_update_exception)
-        if "error" in error_message:
-            try:
-                error_json = json.loads(error_message)
-                return error_json.get("error", "").lower() == "order does not exist"
-            except Exception:
-                pass
-        return "order does not exist" in error_message.lower()
+        is_error_related_to_not_found = "order_not_found" in error_message.lower()
+        return is_error_related_to_not_found
+        
+    def _is_position_already_closed_error(self, exception: Exception) -> bool:
+        """
+        Determines if the error is related to attempting to close a position that is already closed.
+        :param exception: The error received during order placement or position operation
+        :return: True if the error indicates the position is already closed
+        """
+        error_message = str(exception).lower()
+        position_closed_indicators = [
+            "wouldnotreduceposition",
+            "would not reduce position",
+            "position not open",
+            "position already closed",
+            "no position to reduce"
+        ]
+        
+        for indicator in position_closed_indicators:
+            if indicator in error_message:
+                self.logger().info(f"Detected position already closed error: {error_message}")
+                return True
+                
+        return False
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         """
@@ -372,6 +391,13 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         # Add detailed debugging of the API response
         self.logger().info(f"Kraken API response for {order_type.name} order: {order_result}")
 
+        # Check for position already closed error
+        if "sendStatus" in order_result and "status" in order_result["sendStatus"]:
+            status = order_result["sendStatus"]["status"]
+            if status == "wouldNotReducePosition":
+                self.logger().info(f"Position already closed: Kraken responded with 'wouldNotReducePosition' for {trading_pair}")
+                raise IOError("Position already closed - would not reduce position")
+
         if order_result.get("result") != "success":
             error_msg = order_result.get("error", "Unknown error")
             raise IOError(f"Error placing order: {error_msg}")
@@ -400,14 +426,29 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().info(f"MARKET ORDER RESPONSE DEBUG - Order ID extracted: {exchange_order_id}")
             self.logger().info(f"MARKET ORDER RESPONSE DEBUG - Order parameters: {data}")
 
+        # Special case: successful request but status indicates position already closed
+        if order_result.get("result") == "success" and "sendStatus" in order_result:
+            status = order_result["sendStatus"].get("status", "")
+            if status == "wouldNotReducePosition":
+                self.logger().info(f"Position already closed: Received 'wouldNotReducePosition' for {trading_pair}")
+                raise IOError("Position already closed - would not reduce position")
+
         if not exchange_order_id:
             # If we still can't find an order ID, try to use any ID in the response as fallback
             if "sendStatus" in order_result:
-                if "status" in order_result["sendStatus"] and order_result["sendStatus"]["status"] == "placed":
-                    # For successful orders that don't have a clear ID, generate one based on timestamp
-                    fallback_id = f"fallback-{order_id}-{self.current_timestamp}"
-                    self.logger().warning(f"Could not extract order ID from response, using fallback ID: {fallback_id}")
-                    return fallback_id, self.current_timestamp
+                if "status" in order_result["sendStatus"]:
+                    status = order_result["sendStatus"]["status"]
+                    
+                    # Check for common "position already closed" status codes
+                    if status == "wouldNotReducePosition":
+                        self.logger().info(f"Position already closed: Received 'wouldNotReducePosition' for {trading_pair}")
+                        raise IOError("Position already closed - would not reduce position")
+                    
+                    if status == "placed":
+                        # For successful orders that don't have a clear ID, generate one based on timestamp
+                        fallback_id = f"fallback-{order_id}-{self.current_timestamp}"
+                        self.logger().warning(f"Could not extract order ID from response, using fallback ID: {fallback_id}")
+                        return fallback_id, self.current_timestamp
             
             # If all else fails, raise the exception
             raise IOError("Could not extract order ID from response")
@@ -1268,7 +1309,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                         fill["source"] = "fills_snapshot"
                     
                     # Check if this is an assignment fill
-                    if fill.get("fill_type") == "assignment" or fill.get("fill_type") == "assignee":
+                    if fill.get("fill_type") == "maker": # or fill.get("fill_type") == "assignee":
                         self.logger().info(f"Processing {'historical' if is_snapshot else 'real-time'} assignment fill: {fill}")
                         self._process_assignment_fill(fill)
                     else:
@@ -1448,7 +1489,7 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                     flex_futures_data = data.get("flex_futures", {})
             
             if flex_futures_data is None:
-                self.logger().debug(f"No flex_futures data in wallet message: {wallet_msg}")
+                # Removed debug log message that was causing unwanted output
                 return
             
             # Process currencies in flex_futures account
@@ -1655,8 +1696,8 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                 min_price_increment = Decimal(str(instrument["tickSize"]))
                 min_base_amount_increment = min_order_size
 
-                # For Kraken Perpetual, the collateral token is always the quote currency
-                quote_currency = "USD"
+                # Set USD as the collateral token for all trading pairs
+                collateral_token = "USD"
 
                 trading_rule = TradingRule(
                     trading_pair=trading_pair,
@@ -1666,8 +1707,8 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
                     min_base_amount_increment=min_base_amount_increment,
                     min_notional_size=Decimal("0"),  # Kraken doesn't specify this
                     min_order_value=Decimal("0"),  # Kraken doesn't specify this
-                    buy_order_collateral_token=quote_currency,
-                    sell_order_collateral_token=quote_currency,
+                    buy_order_collateral_token=collateral_token,
+                    sell_order_collateral_token=collateral_token,
                 )
 
                 trading_rules[trading_pair] = trading_rule

@@ -146,7 +146,7 @@ class MarketMakingControllerConfigBase(ControllerConfigBase):
             take_profit=self.take_profit,
             time_limit=self.time_limit,
             trailing_stop=self.trailing_stop,
-            open_order_type=OrderType.LIMIT,  # Defaulting to LIMIT as is a Maker Controller
+            open_order_type=OrderType.LIMIT_MAKER,  # Defaulting to LIMIT as is a Maker Controller
             take_profit_order_type=self.take_profit_order_type,
             stop_loss_order_type=OrderType.MARKET,  # Defaulting to MARKET as per requirement
             time_limit_order_type=OrderType.MARKET  # Defaulting to MARKET as per requirement

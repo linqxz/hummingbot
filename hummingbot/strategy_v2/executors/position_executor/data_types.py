@@ -19,7 +19,7 @@ class TripleBarrierConfig(BaseModel):
     take_profit: Optional[Decimal]
     time_limit: Optional[int]
     trailing_stop: Optional[TrailingStop]
-    open_order_type: OrderType = OrderType.LIMIT
+    open_order_type: OrderType = OrderType.LIMIT_MAKER
     take_profit_order_type: OrderType = OrderType.MARKET
     stop_loss_order_type: OrderType = OrderType.MARKET
     time_limit_order_type: OrderType = OrderType.MARKET
@@ -45,7 +45,9 @@ class TripleBarrierConfig(BaseModel):
 
 
 class PositionExecutorConfig(ExecutorConfigBase):
+    # Important: This must be unique and match what's expected in executor_orchestrator.py
     type = "position_executor"
+    
     trading_pair: str
     connector_name: str
     side: TradeType
