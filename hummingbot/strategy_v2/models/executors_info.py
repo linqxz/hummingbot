@@ -1,7 +1,7 @@
 from decimal import Decimal
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel
+from pydantic.v1 import BaseModel
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
@@ -84,4 +84,5 @@ class PerformanceReport(BaseModel):
     volume_traded: Decimal = Decimal("0")
     open_order_volume: Decimal = Decimal("0")
     inventory_imbalance: Decimal = Decimal("0")
+    positions_summary: List = []
     close_type_counts: Dict[CloseType, int] = {}

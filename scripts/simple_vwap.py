@@ -4,7 +4,7 @@ import os
 from decimal import Decimal
 from typing import Dict
 
-from pydantic import Field
+from pydantic.v1 import Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel, ClientFieldData
 from hummingbot.connector.connector_base import ConnectorBase
@@ -162,7 +162,6 @@ class VWAPExample(ScriptStrategyBase):
     def did_fill_order(self, event: OrderFilledEvent):
         """
          Listens to fill order event to log it and notify the Hummingbot application.
-         If you set up Telegram bot, you will get notification there as well.
          """
         if event.trading_pair == self.vwap["trading_pair"] and event.trade_type == self.vwap["trade_type"]:
             self.vwap["volume_remaining"] -= event.amount

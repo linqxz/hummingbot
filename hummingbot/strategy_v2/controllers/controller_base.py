@@ -6,7 +6,7 @@ import inspect
 from decimal import Decimal
 from typing import Callable, Dict, List, Set
 
-from pydantic import Field, validator
+from pydantic.v1 import Field, validator
 
 from hummingbot.client.config.config_data_types import BaseClientModel, ClientFieldData
 from hummingbot.core.data_type.trade_fee import TokenAmount
@@ -127,6 +127,7 @@ class ControllerBase(RunnableBase):
         super().__init__(update_interval=update_interval)
         self.config = config
         self.executors_info: List[ExecutorInfo] = []
+        self.positions_held: List[Dict] = []
         self.market_data_provider: MarketDataProvider = market_data_provider
         self.actions_queue: asyncio.Queue = actions_queue
         self.processed_data = {}

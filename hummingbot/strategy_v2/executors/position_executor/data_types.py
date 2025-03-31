@@ -45,9 +45,7 @@ class TripleBarrierConfig(BaseModel):
 
 
 class PositionExecutorConfig(ExecutorConfigBase):
-    # Important: This must be unique and match what's expected in executor_orchestrator.py
     type = "position_executor"
-    
     trading_pair: str
     connector_name: str
     side: TradeType
