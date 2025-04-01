@@ -3,7 +3,7 @@ from abc import abstractmethod
 from decimal import Decimal
 from typing import Any, Dict, List, Set
 
-from pydantic import Field, validator
+from pydantic.v1 import Field, validator
 
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.client.hummingbot_application import HummingbotApplication

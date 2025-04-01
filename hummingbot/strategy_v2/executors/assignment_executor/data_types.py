@@ -5,7 +5,7 @@ import traceback
 from decimal import Decimal
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic.v1 import BaseModel
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase

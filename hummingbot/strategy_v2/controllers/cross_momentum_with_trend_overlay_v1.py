@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Dict, List, Set, Tuple
 
 import numpy as np
-from pydantic import Field
+from pydantic.v1 import Field
 
 from controllers.directional_trading.ema_crossover_v1 import EMACrossoverController, EMACrossoverControllerConfig
 from hummingbot.client.config.config_data_types import ClientFieldData

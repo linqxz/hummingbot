@@ -1,7 +1,7 @@
 from typing import Dict, List, Set
 
 import pandas as pd
-from pydantic import Field
+from pydantic.v1 import Field
 
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesConfig

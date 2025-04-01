@@ -2,7 +2,7 @@ import os
 from decimal import Decimal
 from typing import Dict, List, Set
 
-from pydantic import Field
+from pydantic.v1 import Field
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.clock import Clock

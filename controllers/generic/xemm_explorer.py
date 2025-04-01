@@ -7,7 +7,7 @@ from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.strategy_v2.executors.xemm_explorer_executor.data_types import XEMMExplorerExecutorConfig
-from pydantic import Field, validator
+from pydantic.v1 import Field, validator
 
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.client.ui.interface_utils import format_df_for_printout

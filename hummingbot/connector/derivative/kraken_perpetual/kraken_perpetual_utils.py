@@ -5,9 +5,9 @@ from decimal import Decimal
 from typing import Any, Dict
 
 try:
-    from pydantic import Field, SecretStr
+    from pydantic.v1 import Field, SecretStr
 except ImportError:
-    from pydantic import Field, SecretStr
+    from pydantic.v1 import Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap, ClientFieldData
 from hummingbot.connector.derivative.kraken_perpetual import kraken_perpetual_constants as CONSTANTS

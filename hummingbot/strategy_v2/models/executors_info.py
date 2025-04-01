@@ -5,7 +5,7 @@ from pydantic.v1 import BaseModel
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
-from hummingbot.strategy_v2.executors.assignment_executor.data_types import AssignmentExecutorConfig
+# from hummingbot.strategy_v2.executors.assignment_executor.data_types import AssignmentExecutorConfig
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
 from hummingbot.strategy_v2.executors.dca_executor.data_types import DCAExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
@@ -28,7 +28,6 @@ class ExecutorInfo(BaseModel):
         ArbitrageExecutorConfig,
         DCAExecutorConfig,
         TWAPExecutorConfig,
-        AssignmentExecutorConfig,
         ExecutorConfigBase
     ]
     net_pnl_pct: Decimal
