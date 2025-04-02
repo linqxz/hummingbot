@@ -131,6 +131,9 @@ class AssignmentManagerController(ControllerBase):
     # Add this class variable
     _last_verbose_check_timestamp = 0
     _VERBOSE_CHECK_INTERVAL = 60  # 60 seconds between full verbose checks
+    
+    # Set of fill_ids currently being processed (to prevent duplicates)
+    _processing_fill_ids = set()
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -148,6 +151,9 @@ class AssignmentManagerController(ControllerBase):
         self.assignments = {}  # Track assignments by fill_id
         self.assigned_executors = {}  # Track executors created for assignments
         self._last_status_report_timestamp = 0
+        
+        # Create a lock for assignment processing
+        self._assignment_lock = asyncio.Lock()
 
         # Create event listeners using EventForwarder
         self._assignment_fill_listener = EventForwarder(self._on_assignment_fill)
@@ -227,100 +233,120 @@ class AssignmentManagerController(ControllerBase):
         Handler for assignment fill events.
         Creates executors to close the assigned positions.
         """
+        # Extract key information from the event first before acquiring lock
+        fill_id = getattr(event, "fill_id", None)
+        if not fill_id:
+            self.logger().error("[ASSIGNMENT] Assignment event missing fill_id")
+            return
+
+        # Check if already being processed without acquiring the full lock
+        if fill_id in self._processing_fill_ids:
+            self.logger().debug(f"[ASSIGNMENT] Already processing assignment {fill_id}, skipping duplicate")
+            return
+            
+        # Create a task to process this with the lock
+        safe_ensure_future(self._process_assignment_fill_with_lock(event, fill_id))
+        
+    async def _process_assignment_fill_with_lock(self, event: AssignmentFillEvent, fill_id: str):
+        """Process assignment fill with mutex lock protection"""
+        # Double-check if already being processed before trying to acquire lock
+        if fill_id in self._processing_fill_ids:
+            self.logger().debug(f"[ASSIGNMENT] Already processing assignment {fill_id}, skipping duplicate (pre-lock check)")
+            return
+            
+        # Add to processing set to prevent parallel processing
+        self._processing_fill_ids.add(fill_id)
+        
         try:
-            # Extract key information from the event
-            fill_id = getattr(event, "fill_id", None)
-            if not fill_id:
-                self.logger().error("[ASSIGNMENT] Assignment event missing fill_id")
-                return
-
-            trading_pair = getattr(event, "trading_pair", "")
-            if not trading_pair:
-                self.logger().error("[ASSIGNMENT] Assignment event missing trading_pair")
-                return
-
-            # Ensure trading pair is valid
-            if not self._is_valid_trading_pair(trading_pair):
-                self.logger().warning(f"[ASSIGNMENT] Trading pair {trading_pair} not known to connector")
-                if not self.config.all_trading_pairs:
-                    self.logger().debug(f"[ASSIGNMENT] Ignoring assignment for {trading_pair} as it's not in watched pairs")
+            # Acquire the lock for critical section
+            async with self._assignment_lock:
+                trading_pair = getattr(event, "trading_pair", "")
+                if not trading_pair:
+                    self.logger().error("[ASSIGNMENT] Assignment event missing trading_pair")
                     return
 
-            # Check if this assignment already exists
-            if fill_id in self.assignments:
-                self.logger().debug(f"[ASSIGNMENT] Assignment {fill_id} already exists, skipping")
-                return
+                # Ensure trading pair is valid
+                if not self._is_valid_trading_pair(trading_pair):
+                    self.logger().warning(f"[ASSIGNMENT] Trading pair {trading_pair} not known to connector")
+                    if not self.config.all_trading_pairs:
+                        self.logger().debug(f"[ASSIGNMENT] Ignoring assignment for {trading_pair} as it's not in watched pairs")
+                        return
 
-            # Store assignment info with EXECUTING status directly (no PENDING state)
-            self.assignments[fill_id] = {
-                "event": event,
-                "timestamp": getattr(event, "timestamp", int(time.time() * 1000)),
-                "trading_pair": trading_pair,
-                "position_side": getattr(event, "position_side", "UNKNOWN"),
-                "amount": getattr(event, "amount", 0),
-                "price": getattr(event, "price", 0),
-                "order_id": getattr(event, "order_id", ""),
-                "status": "EXECUTING",  # Start as EXECUTING directly
-                "executor_id": None
-            }
+                # Check if this assignment already exists
+                if fill_id in self.assignments:
+                    self.logger().debug(f"[ASSIGNMENT] Assignment {fill_id} already exists, skipping")
+                    return
 
-            self.logger().debug(f"[ASSIGNMENT] Received assignment fill: {trading_pair} "
-                               f"{getattr(event, 'position_side', 'UNKNOWN')} "
-                               f"amount={getattr(event, 'amount', 0)} "
-                               f"price={getattr(event, 'price', 0)} "
-                               f"fill_id={fill_id}")
+                # Store assignment info with EXECUTING status directly (no PENDING state)
+                self.assignments[fill_id] = {
+                    "event": event,
+                    "timestamp": getattr(event, "timestamp", int(time.time() * 1000)),
+                    "trading_pair": trading_pair,
+                    "position_side": getattr(event, "position_side", "UNKNOWN"),
+                    "amount": getattr(event, "amount", 0),
+                    "price": getattr(event, "price", 0),
+                    "order_id": getattr(event, "order_id", ""),
+                    "status": "EXECUTING",  # Start as EXECUTING directly
+                    "executor_id": None
+                }
 
-            # Immediately create and queue an executor
-            safe_ensure_future(self._immediate_executor_creation(fill_id))
+                self.logger().info(f"[ASSIGNMENT] Received assignment fill: {trading_pair} "
+                                  f"{getattr(event, 'position_side', 'UNKNOWN')} "
+                                  f"amount={getattr(event, 'amount', 0)} "
+                                  f"price={getattr(event, 'price', 0)} "
+                                  f"fill_id={fill_id}")
 
+                # Create executor config
+                config = self._create_executor_config(fill_id)
+                if not config:
+                    self.logger().error(f"[IMMEDIATE CREATION] Failed to create config for assignment {fill_id}")
+                    return
+                
+                # Mark executor in assignments with actual ID (not pending)
+                self.assignments[fill_id]["executor_id"] = config.id
+                self.logger().info(f"[IMMEDIATE CREATION] Created executor with ID {config.id} for assignment {fill_id}")
+                
+                # Create the action
+                action = CreateExecutorAction(
+                    controller_id=self.config.id,
+                    executor_config=config
+                )
+                
+                # Put the action in a list before putting it in the queue
+                # This is because the listener expects a list of actions
+                actions = [action]
+                
+                # Put the actions list directly into the queue
+                await self.actions_queue.put(actions)
+                self.logger().info(f"[IMMEDIATE CREATION] Queued executor action with ID {config.id} for assignment {fill_id}")
+                
+                # Also record in our assigned_executors dict for future reference
+                self.assigned_executors[config.id] = {
+                    "fill_id": fill_id, 
+                    "timestamp": time.time(),
+                    "status": "ACTIVE",
+                    "config": config
+                }
+                self.logger().debug(f"[EXECUTOR TRACKING] Assignment {fill_id} now linked to executor {config.id}")
+                
         except Exception as e:
             self.logger().error(f"[ASSIGNMENT] Error processing assignment fill: {e}", exc_info=True)
+        finally:
+            # Remove from processing set when done
+            if fill_id in self._processing_fill_ids:
+                self._processing_fill_ids.remove(fill_id)
 
     async def _immediate_executor_creation(self, fill_id: str):
         """
         Immediately create an executor for a new assignment without waiting for the next update cycle.
+        This method is now deprecated in favor of creating the executor directly in _process_assignment_fill_with_lock.
         
         :param fill_id: The ID of the assignment to create an executor for
         """
-        try:
-            self.logger().debug(f"[IMMEDIATE CREATION] Starting immediate executor creation for assignment {fill_id}")
-            
-            # Check if assignment exists
-            if fill_id not in self.assignments:
-                self.logger().error(f"[IMMEDIATE CREATION] Assignment {fill_id} not found")
-                return
-            
-            # Skip if this assignment already has an executor assigned
-            assignment = self.assignments[fill_id]
-            if assignment.get("executor_id"):
-                self.logger().debug(f"[IMMEDIATE CREATION] Assignment {fill_id} already has executor {assignment.get('executor_id')}")
-                return
-            
-            # Create executor config
-            config = self._create_executor_config(fill_id)
-            if not config:
-                self.logger().error(f"[IMMEDIATE CREATION] Failed to create config for assignment {fill_id}")
-                return
-            
-            # Create the action
-            action = CreateExecutorAction(
-                controller_id=self.config.id,
-                executor_config=config
-            )
-            
-            # Put the action in a list before putting it in the queue
-            # This is because the listener expects a list of actions
-            actions = [action]
-            
-            # Put the actions list directly into the queue
-            await self.actions_queue.put(actions)
-            
-            self.logger().debug(f"[IMMEDIATE CREATION] Created and queued executor action with ID {config.id} for assignment {fill_id}")
-            
-        except Exception as e:
-            self.logger().error(f"[IMMEDIATE CREATION] Error in immediate executor creation for {fill_id}: {e}", exc_info=True)
+        self.logger().warning(f"[IMMEDIATE CREATION] _immediate_executor_creation is deprecated, skipping for {fill_id}")
+        return  # Skip this method as it's now handled in the locked processing
 
-    def can_create_assignment_executor(self, fill_id: str) -> bool:
+    async def can_create_assignment_executor(self, fill_id: str) -> bool:
         """
         Check if an assignment executor can be created for a specific fill_id.
         
@@ -330,48 +356,50 @@ class AssignmentManagerController(ControllerBase):
         Returns:
             bool: True if an executor can be created, False otherwise
         """
-        # Check if the assignment exists
-        if fill_id not in self.assignments:
-            self.logger().warning(f"[EXECUTOR CHECK] Cannot create executor for unknown assignment {fill_id}")
-            return False
-        
-        assignment = self.assignments[fill_id]
-        
-        # Check if assignment is already closed
-        if assignment.get("status") == "CLOSED":
-            self.logger().debug(f"[EXECUTOR CHECK] Assignment {fill_id} is already closed")
-            return False
-        
-        # Don't create if we already have an executor ID assigned
-        if assignment.get("executor_id") is not None:
-            self.logger().debug(f"[EXECUTOR CHECK] Assignment {fill_id} already has executor_id {assignment.get('executor_id')}")
-            return False
-        
-        # Look for existing executors already handling this assignment
-        for executor_info in self.executors_info:
-            # Check if this executor has the matching assignment_id
-            if (hasattr(executor_info.config, 'assignment_id') and 
-                executor_info.config.assignment_id == fill_id):
-                
-                self.logger().debug(f"[EXECUTOR CHECK] Found existing executor {executor_info.id} for assignment {fill_id}")
-                
-                # Update assignment tracking
-                assignment["executor_id"] = executor_info.id
-                assignment["status"] = "EXECUTING" if executor_info.is_active else "CLOSED"
-                
-                # Update executor tracking
-                self.assigned_executors[executor_info.id] = {
-                    "fill_id": fill_id,
-                    "timestamp": time.time(),
-                    "status": "ACTIVE" if executor_info.is_active else "COMPLETED",
-                    "config": executor_info.config,
-                }
-                
-                return False  # Don't create a new executor
-        
-        # If we get here, no executor exists for this assignment
-        self.logger().debug(f"[EXECUTOR CHECK] No existing executor found for assignment {fill_id}, can create one")
-        return True
+        # Use lock to prevent races when checking executor status
+        async with self._assignment_lock:
+            # Check if the assignment exists
+            if fill_id not in self.assignments:
+                self.logger().warning(f"[EXECUTOR CHECK] Cannot create executor for unknown assignment {fill_id}")
+                return False
+            
+            assignment = self.assignments[fill_id]
+            
+            # Check if assignment is already closed
+            if assignment.get("status") == "CLOSED":
+                self.logger().debug(f"[EXECUTOR CHECK] Assignment {fill_id} is already closed")
+                return False
+            
+            # Don't create if we already have an executor ID assigned
+            if assignment.get("executor_id") is not None:
+                self.logger().debug(f"[EXECUTOR CHECK] Assignment {fill_id} already has executor_id {assignment.get('executor_id')}")
+                return False
+            
+            # Look for existing executors already handling this assignment
+            for executor_info in self.executors_info:
+                # Check if this executor has the matching assignment_id
+                if (hasattr(executor_info.config, 'assignment_id') and 
+                    executor_info.config.assignment_id == fill_id):
+                    
+                    self.logger().debug(f"[EXECUTOR CHECK] Found existing executor {executor_info.id} for assignment {fill_id}")
+                    
+                    # Update assignment tracking
+                    assignment["executor_id"] = executor_info.id
+                    assignment["status"] = "EXECUTING" if executor_info.is_active else "CLOSED"
+                    
+                    # Update executor tracking
+                    self.assigned_executors[executor_info.id] = {
+                        "fill_id": fill_id,
+                        "timestamp": time.time(),
+                        "status": "ACTIVE" if executor_info.is_active else "COMPLETED",
+                        "config": executor_info.config,
+                    }
+                    
+                    return False  # Don't create a new executor
+            
+            # If we get here, no executor exists for this assignment
+            self.logger().debug(f"[EXECUTOR CHECK] No existing executor found for assignment {fill_id}, can create one")
+            return True
 
     def create_actions_proposal(self) -> List[ExecutorAction]:
         """
@@ -379,32 +407,44 @@ class AssignmentManagerController(ControllerBase):
         """
         create_actions = []
         
+        # Using a list to avoid modifying dict during iteration
+        assignments_to_check = list(self.assignments.items())
+        self.logger().info(f"[EXECUTOR CREATION] Starting executor creation proposal, checking {len(assignments_to_check)} assignments")
+        
         # Create executors for assignments without executors
-        for fill_id, assignment in self.assignments.items():
+        for fill_id, assignment in assignments_to_check:
             # Skip if this assignment is already closed
             if assignment.get("status") == "CLOSED":
                 continue
             
             # Skip if this assignment already has an executor
             if assignment.get("executor_id"):
+                self.logger().info(f"[EXECUTOR CREATION] Assignment {fill_id} already has executor {assignment.get('executor_id')}")
                 continue
             
-            # Check if we can create an executor
-            if self.can_create_assignment_executor(fill_id):
-                # Create executor config
-                config = self._create_executor_config(fill_id)
-                if not config:
-                    self.logger().error(f"[EXECUTOR CREATION] Failed to create config for assignment {fill_id}")
-                    continue
+            # Check if we can create an executor - without awaiting to avoid deadlocks in this sync method
+            # This isn't ideal, but since create_actions_proposal must be synchronous, we can do a basic check here
+            if fill_id in self._processing_fill_ids:
+                self.logger().debug(f"[EXECUTOR CREATION] Assignment {fill_id} is currently being processed, skipping")
+                continue
                 
-                # Create the action
-                action = CreateExecutorAction(
-                    controller_id=self.config.id,
-                    executor_config=config
-                )
+            trading_pair = assignment.get("trading_pair", "UNKNOWN")
+            self.logger().info(f"[EXECUTOR CREATION] Assignment {fill_id}: status={assignment.get('status')}, executor_id={assignment.get('executor_id')}, trading_pair={trading_pair}")
+            
+            # Create executor config
+            config = self._create_executor_config(fill_id)
+            if not config:
+                self.logger().error(f"[EXECUTOR CREATION] Failed to create config for assignment {fill_id}")
+                continue
+            
+            # Create the action
+            action = CreateExecutorAction(
+                controller_id=self.config.id,
+                executor_config=config
+            )
 
-                create_actions.append(action)
-                self.logger().debug(f"[EXECUTOR CREATION] Created executor action for assignment {fill_id}")
+            create_actions.append(action)
+            self.logger().debug(f"[EXECUTOR CREATION] Created executor action for assignment {fill_id}")
         
         if create_actions:
             self.logger().debug(f"[EXECUTOR CREATION] Created {len(create_actions)} executor actions in total")
@@ -554,39 +594,56 @@ class AssignmentManagerController(ControllerBase):
             self.logger().error(f"Error checking trading pair {trading_pair}: {e}")
             return False
 
-    def on_executor_completed(self, executor_id: str, return_val: Any) -> None:
-        """Handle completed executors"""
-        if executor_id in self.assigned_executors:
-            executor_info = self.assigned_executors[executor_id]
-            fill_id = executor_info["fill_id"]
-
-            # Update assignment status
-            if fill_id in self.assignments:
-                self.assignments[fill_id]["status"] = "CLOSED"
-                self.logger().debug(f"Assignment {fill_id} closed successfully")
-                
-                # Since we're removing the executor, we should also remove the assignment if it's not recent
-                # Get the timestamp to determine if we should remove now
-                timestamp = self.assignments[fill_id].get("timestamp", 0)
-                if timestamp > 1000000000000:  # If in milliseconds
-                    timestamp = timestamp / 1000
-                    
-                # If the completion is recent (within last 10 minutes), keep the assignment for reference
-                # Otherwise, immediately remove both executor and assignment
-                current_time = time.time()
-                if current_time - timestamp > 600:  # 10 minutes
-                    self.logger().debug(f"Immediately removing completed assignment {fill_id} (age: {(current_time - timestamp) / 60:.1f} minutes)")
-                    del self.assignments[fill_id]
-
-            # Update executor status
-            executor_info["status"] = "COMPLETED"
-
-            # Immediately remove this completed executor
-            self.logger().debug(f"Immediately removing completed executor {executor_id} for assignment {fill_id}")
-            del self.assigned_executors[executor_id]
+    async def on_executor_completed(self, executor_id: str, close_type: str = None, reason: str = None):
+        """
+        Handle notification when an executor has completed its task.
+        
+        :param executor_id: The ID of the completed executor
+        :param close_type: The type of completion (e.g., "COMPLETED", "FAILED", "CANCELLED")
+        :param reason: Additional reason information
+        """
+        if executor_id not in self.assigned_executors:
+            self.logger().warning(f"Received completion notification for unknown executor: {executor_id}")
+            return
             
-            # Still run periodic cleanup for other completed items
-            self._clean_up_old_records()
+        # Get the assignment ID for this executor
+        assignment_info = self.assigned_executors[executor_id]
+        fill_id = assignment_info.get("fill_id")
+        
+        if not fill_id or fill_id not in self.assignments:
+            self.logger().warning(f"Cannot find assignment for executor: {executor_id}")
+            return
+            
+        # Update the assignment status based on the close type
+        if close_type in ["COMPLETED", "SUCCESS"]:
+            self.assignments[fill_id]["status"] = "CLOSED"
+            self.logger().info(f"Assignment {fill_id} marked as CLOSED (executor {executor_id} completed successfully)")
+        elif close_type in ["FAILED", "ERROR"]:
+            self.assignments[fill_id]["status"] = "FAILED"
+            self.assignments[fill_id]["error"] = reason or "Executor failed"
+            self.logger().error(f"Assignment {fill_id} marked as FAILED: {reason}")
+        else:
+            # Unknown or null close type - mark as inactive but don't change status
+            self.logger().warning(f"Executor {executor_id} completed with unknown close type: {close_type}")
+            
+        # Update tracking info
+        self.assigned_executors[executor_id]["status"] = "COMPLETED"
+        self.assigned_executors[executor_id]["close_type"] = close_type
+        self.assigned_executors[executor_id]["reason"] = reason
+        
+        # Trigger any additional post-processing if needed
+        await self._process_completed_assignment(fill_id, executor_id, close_type)
+        
+    async def _process_completed_assignment(self, fill_id: str, executor_id: str, close_type: str):
+        """
+        Perform any post-processing after an assignment has been completed.
+        Override this in subclasses if needed.
+        
+        :param fill_id: The assignment ID
+        :param executor_id: The executor ID
+        :param close_type: How the execution was completed
+        """
+        pass
 
     def on_executor_failed(self, executor_id: str, exception: Exception) -> None:
         """Handle failed executors"""
@@ -621,6 +678,14 @@ class AssignmentManagerController(ControllerBase):
             
             # Still run periodic cleanup for other completed items
             self._clean_up_old_records()
+            
+        # Also check if there's a pending executor ID that matches this failed executor
+        for fill_id, assignment in list(self.assignments.items()):
+            if assignment.get("executor_id") == f"pending_{executor_id}":
+                # Update the assignment with the actual executor ID and mark as FAILED
+                self.logger().info(f"Updating assignment {fill_id} from pending to FAILED (executor {executor_id} failed)")
+                assignment["executor_id"] = executor_id
+                assignment["status"] = "FAILED"
 
     def _clean_up_old_records(self, force=False):
         """Clean up old completed records to prevent memory leaks"""
@@ -878,95 +943,60 @@ class AssignmentManagerController(ControllerBase):
 
     async def _periodic_executor_check(self):
         """
-        Periodically check and synchronize executor status.
-        
-        This ensures we don't miss any state changes even if events are missed.
-        It provides a safety net for status tracking.
+        Periodically check executor status and update assignments accordingly.
+        This simpler implementation just checks if executors exist and their status.
         """
-        while not self.terminated.is_set():
+        while True:
             try:
-                current_time = time.time()
-                do_verbose_check = current_time - self._last_verbose_check_timestamp > self._VERBOSE_CHECK_INTERVAL
+                await asyncio.sleep(5.0)  # Check every 5 seconds
                 
-                if do_verbose_check:
-                    # Update our timestamp for verbose checks
-                    self._last_verbose_check_timestamp = current_time
-                    
-                    # Log current state for diagnostics
-                    executing_count = sum(1 for a in self.assignments.values() if a.get("status") == "EXECUTING")
-                    closed_count = sum(1 for a in self.assignments.values() if a.get("status") in ["CLOSED", "FAILED"])
-                    
-                    active_executor_count = sum(1 for e in self.assigned_executors.values() if e["status"] == "ACTIVE")
-                    completed_executor_count = sum(1 for e in self.assigned_executors.values() if e["status"] == "COMPLETED")
-                    
-                    executing_ids = [fill_id for fill_id, a in self.assignments.items() if a.get("status") == "EXECUTING"]
-                    
-                    self.logger().debug(
-                        f"[PERIODIC CHECK] Assignment status: {len(self.assignments)} total, "
-                        f"{executing_count} executing, {closed_count} closed/failed"
-                    )
-                    
-                    # Check for executors that should be completed but might be stuck
-                    stuck_executors = []
-                    for executor_info in self.executors_info:
-                        if (executor_info.type == "assignment_adapter_executor" and 
-                            executor_info.status not in [RunnableStatus.TERMINATED] and
-                            not executor_info.is_active):
+                # Get current set of active executors
+                active_executor_ids = set()
+                completed_executor_ids = set()
+                
+                # Process all executors and categorize them
+                for executor_info in self.executors_info:
+                    if hasattr(executor_info.config, 'assignment_id'):
+                        if executor_info.is_active:
+                            active_executor_ids.add(executor_info.id)
+                        else:
+                            completed_executor_ids.add(executor_info.id)
+                
+                # Update our tracking for any assignments with executors not found in either set
+                for fill_id, assignment in list(self.assignments.items()):
+                    if assignment.get("status") == "CLOSED":
+                        continue  # Skip already closed assignments
+                        
+                    executor_id = assignment.get("executor_id")
+                    if not executor_id:
+                        continue  # Skip assignments without executors
+                        
+                    # Check if this executor is still valid
+                    if executor_id not in active_executor_ids and executor_id not in completed_executor_ids:
+                        # Missing executor - likely it completed but we didn't catch the notification
+                        # Check if it has been missing for a while (over 30 seconds)
+                        executor_missing_time = time.time() - self.assignments[fill_id].get("timestamp", time.time())
+                        if executor_missing_time > 30:
+                            self.logger().debug(f"[EXECUTOR SYNC] Executor {executor_id} for assignment {fill_id} not found (missing for {executor_missing_time:.1f}s)")
                             
-                            # This is potentially stuck - it's not active but not fully terminated
-                            stuck_executors.append(executor_info.id)
-                            self.logger().warning(
-                                f"[PERIODIC CHECK] Executor {executor_info.id} appears stuck: " +
-                                f"status={executor_info.status}, is_active={executor_info.is_active}"
-                            )
-                    
-                    if stuck_executors:
-                        self.logger().warning(f"[PERIODIC CHECK] Found {len(stuck_executors)} executors that appear stuck: {stuck_executors}")
-                        # Force an update to attempt to resolve stuck executors
-                        self.executors_update_event.set()
-                    
-                    # Always check for any assignments without executors
-                    unassigned_assignments = []
-                    for fill_id, assignment in self.assignments.items():
-                        if assignment.get("status") == "EXECUTING" and not assignment.get("executor_id"):
-                            unassigned_assignments.append(fill_id)
-                            self.logger().warning(f"[PERIODIC CHECK] Found executing assignment {fill_id} with no executor_id")
-                    
-                    if unassigned_assignments:
-                        # Trigger the check for unassigned assignments
-                        safe_ensure_future(self._check_for_unassigned_assignments())
+                            # If it's been missing a while, check if we should reset it or mark it complete
+                            # For safety, check if the position still exists on exchange before resetting
+                            
+                            # For now, we'll just reset it to allow retry
+                            self.logger().info(f"[EXECUTOR SYNC] Resetting assignment {fill_id} as its executor {executor_id} was not found")
+                            assignment["executor_id"] = None
                 
-                # Check for assignments that need executors and active executor changes
-                has_active_work = len(self.assignments) > 0
-                completion_changes_detected = False
+                # Periodically run cleanup
+                if time.time() - self._last_cleanup_timestamp > self._CLEANUP_MINIMUM_INTERVAL:
+                    self._clean_up_old_records()
                 
-                # Check for completion state changes
-                for executor_id, executor_info in self.assigned_executors.items():
-                    executor_status = executor_info.get("status")
-                    # Check if any executor was completed since last check
-                    if executor_status == "COMPLETED":
-                        fill_id = executor_info.get("fill_id")
-                        if fill_id in self.assignments:
-                            completion_changes_detected = True
-                            break
-                
-                # Run periodic checks for unassigned assignments
-                await self._check_for_unassigned_assignments()
-                
-                # Clean up old records
-                self._clean_up_old_records()
-                
-                if has_active_work or completion_changes_detected or do_verbose_check:
-                    # Force an update to ensure we're synchronized
-                    self.logger().debug("[PERIODIC CHECK] Triggering executor update event")
-                    self.executors_update_event.set()
-                
-                await asyncio.sleep(15.0)  # Check every 15 seconds
             except asyncio.CancelledError:
-                raise
+                # Task was cancelled, exit gracefully
+                self.logger().debug("Periodic executor check task cancelled")
+                break
             except Exception as e:
-                self.logger().error(f"[PERIODIC CHECK] Error in periodic executor check: {e}", exc_info=True)
-            
+                self.logger().error(f"Error in periodic executor check: {e}", exc_info=True)
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
         Determine actions based on assignments and existing executors.
@@ -1003,3 +1033,183 @@ class AssignmentManagerController(ControllerBase):
                              f"status={assignment['status']}")
 
         return lines 
+
+    async def create_executor(
+        self,
+        fill_id: str,
+        assignment: Dict,
+        executor_type: str,
+    ) -> str:
+        """
+        Create a position executor to handle this assignment.
+        
+        :param fill_id: ID of the position fill event.
+        :param assignment: Assignment data.
+        :param executor_type: Type of executor to create.
+        :return: The ID of the created executor.
+        """
+        self.logger().info(f"Creating {executor_type} executor for assignment: {fill_id}")
+        
+        executor_config = {}
+        executor_id = None
+        try:
+            # Extract basic details from the assignment
+            exchange = assignment.get("exchange")
+            trading_pair = assignment.get("trading_pair")
+            side = assignment.get("side")
+            
+            # Create the executor config based on executor type
+            if executor_type == "ClosePositionExecutor":
+                position_config = {
+                    "exchange": exchange,
+                    "trading_pair": trading_pair,
+                    "amount": assignment.get("amount", 0),
+                    "leverage": assignment.get("leverage", 0),
+                    "side": side,
+                    "position_mode": PositionMode.HEDGE,
+                    "assignment_id": fill_id,  # Store the fill ID in the executor for future reference
+                }
+                
+                order_config = {
+                    "order_id": f"close_position_{fill_id}",
+                    "exchange": exchange,
+                    "trading_pair": trading_pair,
+                    "side": PositionSide.LONG.name if side == PositionSide.SHORT.name else PositionSide.SHORT.name,
+                    "amount_type": AmountType.POSITION_AMOUNT,
+                    "amount": assignment.get("amount", 0),
+                    "order_type": "MARKET",
+                    "price": 0,  # Market order
+                    "position_action": PositionAction.CLOSE,
+                    "position_mode": PositionMode.HEDGE
+                }
+                
+                executor_config = {
+                    "id": f"close_{fill_id}",
+                    "exchange": exchange,
+                    "trading_pair": trading_pair,
+                    "side": side,
+                    "amount": assignment.get("amount", 0),
+                    "leverage": assignment.get("leverage", 0),
+                    "position_config": position_config,
+                    "order_config": order_config,
+                    "safety_module_config": {},
+                    "status_report": True,
+                    "assignment_id": fill_id,  # Store the fill ID for reference
+                }
+            else:
+                raise ValueError(f"Unsupported executor type: {executor_type}")
+            
+            # Create the executor
+            result = await self.create_executor_call(executor_type, executor_config)
+            
+            # Link to created executor's ID
+            executor_id = result.get("id") if isinstance(result, dict) else None
+            
+            if executor_id:
+                # Update assignment status and tracking info
+                self.assignments[fill_id]["executor_id"] = executor_id
+                self.assignments[fill_id]["status"] = "EXECUTING"
+                self.logger().info(f"Executor {executor_id} created for assignment {fill_id}")
+                
+                # Also record in assigned_executors for future reference
+                self.assigned_executors[executor_id] = {
+                    "fill_id": fill_id,
+                    "timestamp": time.time(),
+                    "status": "ACTIVE",
+                    "config": executor_config
+                }
+            else:
+                self.logger().error(f"Failed to create executor for assignment {fill_id}: No executor ID returned")
+        
+        except Exception as e:
+            self.logger().error(f"Error creating executor for assignment {fill_id}: {e}", exc_info=True)
+            # Update assignment to show failure
+            self.assignments[fill_id]["status"] = "FAILED"
+            self.assignments[fill_id]["error"] = str(e)
+            
+        return executor_id 
+
+    async def _handle_assignment(self, fill_id: str) -> bool:
+        """
+        Handle a pending position assignment by creating an executor for it
+        
+        :param fill_id: ID of the position fill event
+        :return: True if handled, False otherwise
+        """
+        if fill_id not in self.assignments:
+            return False
+            
+        assignment = self.assignments[fill_id]
+        
+        # If this assignment already has an executor, check if it's still active
+        if assignment.get("executor_id"):
+            # Assignment already has an executor assigned, check if it's in our active list
+            executor_id = assignment["executor_id"]
+            
+            # Find if this executor is still active in our pool
+            executor_found = False
+            executor_inactive = False
+            
+            for executor_info in self.executors_info:
+                if executor_info.id == executor_id:
+                    executor_found = True
+                    # Check if it's still active
+                    if not executor_info.is_active:
+                        executor_inactive = True
+                    break
+            
+            if executor_found:
+                if executor_inactive:
+                    # Executor exists but is no longer active, wait for on_executor_completed to be called
+                    # or for the periodic status check to handle it
+                    self.logger().debug(f"Assignment {fill_id} has inactive executor {executor_id}, waiting for completion notification")
+                    return True
+                else:
+                    # Executor is still active, nothing to do
+                    return True
+            else:
+                # Executor not found in list, but give it some time (30 seconds) before resetting
+                # This allows for any potential race conditions during startup
+                executor_missing_time = time.time() - assignment.get("timestamp", time.time())
+                if executor_missing_time < 30:
+                    self.logger().debug(f"Assignment {fill_id} has executor {executor_id} not yet found in active list (missing for {executor_missing_time:.1f}s)")
+                    return True
+                    
+                # If we've waited long enough, reset the executor ID to allow retry
+                self.logger().info(f"Resetting assignment {fill_id} as its executor {executor_id} was not found after {executor_missing_time:.1f}s")
+                assignment["executor_id"] = None
+        
+        # Don't retry failed assignments to avoid loops
+        if assignment.get("status") == "FAILED":
+            self.logger().debug(f"Skipping failed assignment {fill_id}")
+            return False
+            
+        # Don't re-handle closed assignments
+        if assignment.get("status") == "CLOSED":
+            self.logger().debug(f"Skipping closed assignment {fill_id}")
+            return False
+        
+        # If we reach here, we need to create a new executor
+        try:
+            # Set status to PENDING before we create the executor
+            assignment["status"] = "PENDING"
+            
+            # Create the appropriate executor based on assignment details
+            executor_id = await self.create_executor(fill_id, assignment, "ClosePositionExecutor")
+            
+            if not executor_id:
+                # If we couldn't create an executor, mark as failed
+                self.logger().error(f"Failed to create executor for assignment {fill_id}")
+                assignment["status"] = "FAILED"
+                assignment["error"] = "Could not create executor"
+                return False
+                
+            # If we got here, we have successfully created an executor
+            return True
+            
+        except Exception as e:
+            # If there was an error creating the executor, mark as failed
+            self.logger().error(f"Error handling assignment {fill_id}: {e}", exc_info=True)
+            assignment["status"] = "FAILED"
+            assignment["error"] = str(e)
+            return False 

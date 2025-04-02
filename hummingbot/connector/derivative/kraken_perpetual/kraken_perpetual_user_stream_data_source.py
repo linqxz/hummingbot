@@ -162,7 +162,7 @@ class KrakenPerpetualUserStreamDataSource(UserStreamTrackerDataSource):
             if feed == CONSTANTS.WS_HEARTBEAT_TOPIC:
                 self.logger().debug(f"♥ Heartbeat received: {message}")
                 return None
-            elif feed == CONSTANTS.WS_BALANCES_TOPIC:
+            elif feed == CONSTANTS.WS_BALANCES_TOPIC or feed == "balances_snapshot":
                 return {
                     "event_type": "balance",
                     "timestamp": timestamp,

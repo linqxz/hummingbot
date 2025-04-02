@@ -346,112 +346,233 @@ class AssignmentAdapterExecutor(PositionExecutor):
         """
         self.logger().info(f"[ASSIGNMENT_ADAPTER] Starting close_position_safely for assignment: {self._assignment_id}")
         
-        # Check the actual position amount from the exchange once more
-        connector = self.connectors[self.config.connector_name]
-        self.logger().info(f"[ASSIGNMENT_ADAPTER] Using connector: {self.config.connector_name}")
+        # Create a lock key specific to this trading pair and connector
+        lock_key = f"{self.config.connector_name}_{self.config.trading_pair}"
         
-        try:
-            # Get position from account_positions
-            position = None
-            trading_pair = self.config.trading_pair
-            self.logger().info(f"[ASSIGNMENT_ADAPTER] Looking for position to close for {trading_pair}")
+        # Create a dictionary of position locks if it doesn't exist on the strategy object
+        if not hasattr(self._strategy, "_position_locks"):
+            self._strategy._position_locks = {}
             
-            # Position side to use if we can't find the position
-            default_position_side = None
-            # Default amount to use if we can't find the position
-            amount_to_close = self._assigned_amount
+        # Create a lock for this position if it doesn't exist
+        if lock_key not in self._strategy._position_locks:
+            self._strategy._position_locks[lock_key] = asyncio.Lock()
             
-            if hasattr(connector, "account_positions"):
-                positions = connector.account_positions
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Found {len(positions)} positions on exchange")
+        # Create a dictionary of pending close amounts if it doesn't exist
+        if not hasattr(self._strategy, "_pending_position_closes"):
+            self._strategy._pending_position_closes = {}
+        
+        # Acquire the lock to prevent multiple executors from closing the same position simultaneously
+        async with self._strategy._position_locks[lock_key]:
+            self.logger().debug(f"[ASSIGNMENT_ADAPTER] Acquired position lock for {lock_key}")
+            
+            # Check the actual position amount from the exchange once more
+            connector = self.connectors[self.config.connector_name]
+            self.logger().info(f"[ASSIGNMENT_ADAPTER] Using connector: {self.config.connector_name}")
+            
+            try:
+                # Get position from account_positions
+                position = None
+                trading_pair = self.config.trading_pair
+                self.logger().info(f"[ASSIGNMENT_ADAPTER] Looking for position to close for {trading_pair}")
                 
-                # Add debug logging for all position keys
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] All position keys in close_position_safely: {list(positions.keys())}")
+                # Position side to use if we can't find the position
+                default_position_side = None
+                # Default amount to use if we can't find the position - use the assignment amount, not the full position
+                amount_to_close = self._assigned_amount
                 
-                # Try different position keys based on position mode
-                if hasattr(connector, "position_key") and callable(connector.position_key):
-                    # First try using position_key helper if available
-                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Attempting to find position using position_key method")
-                    for side in [PositionSide.LONG, PositionSide.SHORT]:
-                        pos_key = connector.position_key(trading_pair, side)
-                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Checking for position with key: {pos_key}")
-                        if pos_key in positions:
-                            position = positions[pos_key]
-                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Found position to close using position_key: {pos_key}")
-                            break
-                
-                # If still not found, try direct lookup
-                if position is None:
-                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Position not found with position_key, trying alternative lookup methods")
+                if hasattr(connector, "account_positions"):
+                    positions = connector.account_positions
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Found {len(positions)} positions on exchange")
                     
-                    # Try direct lookup with trading pair (ONEWAY mode)
-                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Checking for position with direct trading pair: {trading_pair}")
-                    if trading_pair in positions:
-                        position = positions[trading_pair]
-                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Found position to close using direct trading pair lookup")
-                    # Try appending position sides (HEDGE mode)
-                    else:
-                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Checking for position with appended side keys")
-                        for side in ["LONG", "SHORT"]:
-                            pos_key = f"{trading_pair}{side}"
+                    # Add debug logging for all position keys
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] All position keys in close_position_safely: {list(positions.keys())}")
+                    
+                    # Try different position keys based on position mode
+                    if hasattr(connector, "position_key") and callable(connector.position_key):
+                        # First try using position_key helper if available
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Attempting to find position using position_key method")
+                        for side in [PositionSide.LONG, PositionSide.SHORT]:
+                            pos_key = connector.position_key(trading_pair, side)
                             self.logger().info(f"[ASSIGNMENT_ADAPTER] Checking for position with key: {pos_key}")
                             if pos_key in positions:
                                 position = positions[pos_key]
-                                self.logger().info(f"[ASSIGNMENT_ADAPTER] Found position to close using {pos_key}")
-                                # Remember this side for later if needed
-                                default_position_side = PositionSide.LONG if side == "LONG" else PositionSide.SHORT
+                                self.logger().info(f"[ASSIGNMENT_ADAPTER] Found position to close using position_key: {pos_key}")
                                 break
-            
-            if position and abs(position.amount) > Decimal("0"):
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Closing position with amount: {position.amount}, side: {position.position_side}")
+                    
+                    # If still not found, try direct lookup
+                    if position is None:
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Position not found with position_key, trying alternative lookup methods")
+                        
+                        # Try direct lookup with trading pair (ONEWAY mode)
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Checking for position with direct trading pair: {trading_pair}")
+                        if trading_pair in positions:
+                            position = positions[trading_pair]
+                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Found position to close using direct trading pair lookup")
+                        # Try appending position sides (HEDGE mode)
+                        else:
+                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Checking for position with appended side keys")
+                            for side in ["LONG", "SHORT"]:
+                                pos_key = f"{trading_pair}{side}"
+                                self.logger().info(f"[ASSIGNMENT_ADAPTER] Checking for position with key: {pos_key}")
+                                if pos_key in positions:
+                                    position = positions[pos_key]
+                                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Found position to close using {pos_key}")
+                                    # Remember this side for later if needed
+                                    default_position_side = PositionSide.LONG if side == "LONG" else PositionSide.SHORT
+                                    break
                 
-                # Make sure we use the correct side for closing
-                close_side = TradeType.BUY if position.position_side == PositionSide.SHORT else TradeType.SELL
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Using close side: {close_side} for position side: {position.position_side}")
+                if position and abs(position.amount) > Decimal("0"):
+                    position_amount = abs(position.amount)
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Found position with amount: {position_amount}, side: {position.position_side}")
+                    
+                    # Get current pending close amount for this position
+                    position_key = f"{self.config.connector_name}_{trading_pair}"
+                    pending_close_amount = self._strategy._pending_position_closes.get(position_key, Decimal("0"))
+                    
+                    # Calculate available amount to close (total - pending)
+                    available_to_close = position_amount - pending_close_amount
+                    
+                    # If trying to close more than available, cap at available amount
+                    if amount_to_close > available_to_close:
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Capping close amount to available: {available_to_close} " +
+                                          f"(total: {position_amount}, pending: {pending_close_amount}, requested: {amount_to_close})")
+                        amount_to_close = available_to_close
+                    
+                    # If nothing left to close, mark as completed
+                    if amount_to_close <= Decimal("0"):
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] No amount left to close, marking as completed " +
+                                          f"(total: {position_amount}, pending: {pending_close_amount})")
+                        self.close_type = CloseType.COMPLETED
+                        self.stop()
+                        return
+                    
+                    # Register this pending close amount
+                    self._strategy._pending_position_closes[position_key] = pending_close_amount + amount_to_close
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Updated pending close amount to {pending_close_amount + amount_to_close} " +
+                                      f"for {position_key}")
+                    
+                    # Make sure we use the correct side for closing
+                    close_side = TradeType.BUY if position.position_side == PositionSide.SHORT else TradeType.SELL
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Using close side: {close_side} for position side: {position.position_side}")
+                else:
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] No position found in account_positions, will still try to close using assignment data")
+                    
+                    # Determine the position side based on the assignment config or the default from lookup
+                    if default_position_side is None:
+                        # If no position found, guess based on the assignment side (opposite of the trade_type)
+                        default_position_side = PositionSide.SHORT if self.config.side == TradeType.SELL else PositionSide.LONG
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Using inferred position side: {default_position_side} based on assignment side: {self.config.side}")
+                    
+                    # Determine close side from position side
+                    close_side = TradeType.BUY if default_position_side == PositionSide.SHORT else TradeType.SELL
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Using derived close side: {close_side} for inferred position side: {default_position_side}")
+                    
+                    # If no position found, check if there are pending closes
+                    position_key = f"{self.config.connector_name}_{trading_pair}"
+                    pending_close_amount = self._strategy._pending_position_closes.get(position_key, Decimal("0"))
+                    
+                    if pending_close_amount > Decimal("0"):
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Found pending close amount: {pending_close_amount} for {position_key}")
+                        # Position might be in process of being closed by another executor
+                        # Register our amount as pending too
+                        self._strategy._pending_position_closes[position_key] = pending_close_amount + amount_to_close
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Updated pending close amount to {pending_close_amount + amount_to_close}")
+                    else:
+                        # No position found and no pending closes, register our amount
+                        self._strategy._pending_position_closes[position_key] = amount_to_close
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Registered pending close amount: {amount_to_close} for {position_key}")
+                    
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Will attempt to close with original assignment amount: {amount_to_close}")
                 
-                # Update the amount to close
-                amount_to_close = abs(position.amount)
-            else:
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] No position found in account_positions, will still try to close using assignment data")
-                
-                # Determine the position side based on the assignment config or the default from lookup
-                if default_position_side is None:
-                    # If no position found, guess based on the assignment side (opposite of the trade_type)
-                    default_position_side = PositionSide.SHORT if self.config.side == TradeType.SELL else PositionSide.LONG
-                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Using inferred position side: {default_position_side} based on assignment side: {self.config.side}")
-                
-                # Determine close side from position side
-                close_side = TradeType.BUY if default_position_side == PositionSide.SHORT else TradeType.SELL
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Using derived close side: {close_side} for inferred position side: {default_position_side}")
-                
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Will attempt to close with original assignment amount: {amount_to_close}")
-            
-            # Place a direct market order to close the position
-            self.logger().info(f"[ASSIGNMENT_ADAPTER] Placing market order to close position: amount={amount_to_close}, side={close_side}")
-            try:
-                order_id = self.place_order(
-                    connector_name=self.config.connector_name,
-                    trading_pair=self.config.trading_pair,
-                    order_type=OrderType.MARKET,
-                    side=close_side,
-                    amount=amount_to_close,
-                    position_action=PositionAction.CLOSE,
-                )
-                
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Placed close order with ID: {order_id} for amount {amount_to_close} {self.config.trading_pair}")
-                
-                # Create a tracked order
-                self._close_order = TrackedOrder(order_id=order_id)
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Created tracked order for close order: {order_id}")
-                
-                # Set the executor status to shutting down
-                self.close_type = CloseType.TIME_LIMIT
-                self._status = RunnableStatus.SHUTTING_DOWN
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Set status to {self._status} and close_type to {self.close_type}")
-                
-                # Let the control task handle the rest - similar to PositionExecutor
-                return
+                # Place a direct market order to close the position
+                self.logger().info(f"[ASSIGNMENT_ADAPTER] Placing market order to close position: amount={amount_to_close}, side={close_side}")
+                try:
+                    order_id = self.place_order(
+                        connector_name=self.config.connector_name,
+                        trading_pair=self.config.trading_pair,
+                        order_type=OrderType.MARKET,
+                        side=close_side,
+                        amount=amount_to_close,
+                        position_action=PositionAction.CLOSE,
+                    )
+                    
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Placed close order with ID: {order_id} for amount {amount_to_close} {self.config.trading_pair}")
+                    
+                    # Create a tracked order
+                    self._close_order = TrackedOrder(order_id=order_id)
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Created tracked order for close order: {order_id}")
+                    
+                    # Set the executor status to shutting down
+                    self.close_type = CloseType.TIME_LIMIT
+                    self._status = RunnableStatus.SHUTTING_DOWN
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Set status to {self._status} and close_type to {self.close_type}")
+                    
+                    # Let the control task handle the rest - similar to PositionExecutor
+                    return
+                except Exception as e:
+                    error_str = str(e).lower()
+                    # Check for position already closed error using connector's helper method if available
+                    if hasattr(connector, "_is_position_already_closed_error") and callable(connector._is_position_already_closed_error):
+                        if connector._is_position_already_closed_error(e):
+                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Connector confirmed position already closed: {e}")
+                            
+                            # Clear pending close amount for this position
+                            position_key = f"{self.config.connector_name}_{trading_pair}"
+                            if position_key in self._strategy._pending_position_closes:
+                                self._strategy._pending_position_closes[position_key] = max(
+                                    Decimal("0"), 
+                                    self._strategy._pending_position_closes[position_key] - amount_to_close
+                                )
+                                self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount for {position_key}")
+                            
+                            self.close_type = CloseType.COMPLETED
+                            self.stop()
+                            return
+                    # Fallback error message check if connector helper not available
+                    elif ("would not reduce position" in error_str or 
+                          "position not open" in error_str or 
+                          "wouldnotreduceposition" in error_str or
+                          "position already closed" in error_str):
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Error indicates position already closed: {e}")
+                        
+                        # Clear pending close amount for this position
+                        position_key = f"{self.config.connector_name}_{trading_pair}"
+                        if position_key in self._strategy._pending_position_closes:
+                            self._strategy._pending_position_closes[position_key] = max(
+                                Decimal("0"), 
+                                self._strategy._pending_position_closes[position_key] - amount_to_close
+                            )
+                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount for {position_key}")
+                        
+                        self.close_type = CloseType.COMPLETED
+                        self.stop()
+                        return
+                    else:
+                        # For any other error, clear the pending amount and log the error
+                        position_key = f"{self.config.connector_name}_{trading_pair}"
+                        if position_key in self._strategy._pending_position_closes:
+                            self._strategy._pending_position_closes[position_key] = max(
+                                Decimal("0"), 
+                                self._strategy._pending_position_closes[position_key] - amount_to_close
+                            )
+                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount due to error for {position_key}")
+                            
+                        self.logger().error(f"[ASSIGNMENT_ADAPTER] Error placing close order: {e}", exc_info=True)
+                        self._current_retries += 1
+                        return
             except Exception as e:
+                # Clear pending amount in case of error
+                try:
+                    position_key = f"{self.config.connector_name}_{trading_pair}"
+                    if position_key in self._strategy._pending_position_closes:
+                        self._strategy._pending_position_closes[position_key] = max(
+                            Decimal("0"), 
+                            self._strategy._pending_position_closes[position_key] - amount_to_close
+                        )
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount due to exception for {position_key}")
+                except Exception:
+                    pass
+                
                 error_str = str(e).lower()
                 # Check for position already closed error using connector's helper method if available
                 if hasattr(connector, "_is_position_already_closed_error") and callable(connector._is_position_already_closed_error):
@@ -468,34 +589,11 @@ class AssignmentAdapterExecutor(PositionExecutor):
                     self.logger().info(f"[ASSIGNMENT_ADAPTER] Error indicates position already closed: {e}")
                     self.close_type = CloseType.COMPLETED
                     self.stop()
-                    return
                 else:
-                    # For any other error, log it but don't mark as completed yet - we'll retry
-                    self.logger().error(f"[ASSIGNMENT_ADAPTER] Error placing close order: {e}", exc_info=True)
+                    # For other errors, don't mark as completed - increment retries and log the error
+                    self.logger().error(f"[ASSIGNMENT_ADAPTER] Error in close_position_safely: {e}", exc_info=True)
                     self._current_retries += 1
-                    return
-        except Exception as e:
-            error_str = str(e).lower()
-            # Check for position already closed error using connector's helper method if available
-            if hasattr(connector, "_is_position_already_closed_error") and callable(connector._is_position_already_closed_error):
-                if connector._is_position_already_closed_error(e):
-                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Connector confirmed position already closed: {e}")
-                    self.close_type = CloseType.COMPLETED
-                    self.stop()
-                    return
-            # Fallback error message check if connector helper not available
-            elif ("would not reduce position" in error_str or 
-                  "position not open" in error_str or 
-                  "wouldnotreduceposition" in error_str or
-                  "position already closed" in error_str):
-                self.logger().info(f"[ASSIGNMENT_ADAPTER] Error indicates position already closed: {e}")
-                self.close_type = CloseType.COMPLETED
-                self.stop()
-            else:
-                # For other errors, don't mark as completed - increment retries and log the error
-                self.logger().error(f"[ASSIGNMENT_ADAPTER] Error in close_position_safely: {e}", exc_info=True)
-                self._current_retries += 1
-    
+
     async def validate_sufficient_balance_for_closing(self):
         """
         Validate that we have sufficient balance to close the position.
@@ -734,6 +832,17 @@ class AssignmentAdapterExecutor(PositionExecutor):
         position_exists = await self.check_if_position_exists()
         if not position_exists:
             self.logger().info(f"[ASSIGNMENT_ADAPTER] Position appears to be already closed during shutdown, stopping executor")
+            
+            # Clear pending close amount for this position
+            position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+            if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                if self._assigned_amount > Decimal("0"):
+                    self._strategy._pending_position_closes[position_key] = max(
+                        Decimal("0"), 
+                        self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                    )
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount ({self._assigned_amount}) for {position_key}")
+            
             self.close_type = CloseType.COMPLETED
             self.stop()
             return
@@ -748,8 +857,18 @@ class AssignmentAdapterExecutor(PositionExecutor):
         self.logger().debug(f"[ASSIGNMENT_ADAPTER] Open filled amount: {self.open_filled_amount}")
         self.logger().debug(f"[ASSIGNMENT_ADAPTER] Close filled amount: {self.close_filled_amount}")
         
-        # If everything is complete, stop the executor
+        # If everything is complete, stop the executor and update pending close tracking
         if open_orders_completed and order_execution_completed:
+            # Clear pending close amount if the order is completed
+            position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+            if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                filled_amount = self.close_filled_amount if self.close_filled_amount > Decimal("0") else self._assigned_amount
+                self._strategy._pending_position_closes[position_key] = max(
+                    Decimal("0"), 
+                    self._strategy._pending_position_closes[position_key] - filled_amount
+                )
+                self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount ({filled_amount}) for {position_key} after successful order")
+            
             self.logger().info(f"[ASSIGNMENT_ADAPTER] Shutdown conditions met, stopping executor")
             self.stop()
         else:
@@ -779,7 +898,7 @@ class AssignmentAdapterExecutor(PositionExecutor):
         # Sleep a bit to allow for order processing
         self.logger().debug(f"[ASSIGNMENT_ADAPTER] Sleeping for 5 seconds during shutdown")
         await self._sleep(5.0)
-        self.logger().debug(f"[ASSIGNMENT_ADAPTER] Woke up from sleep, control_shutdown_process completed") 
+        self.logger().debug(f"[ASSIGNMENT_ADAPTER] Woke up from sleep, control_shutdown_process completed")
 
     async def control_close_order(self):
         """
@@ -792,6 +911,16 @@ class AssignmentAdapterExecutor(PositionExecutor):
         position_exists = await self.check_if_position_exists()
         if not position_exists:
             self.logger().info(f"[ASSIGNMENT_ADAPTER] Position appears to be already closed, marking as completed")
+            
+            # Clear pending close amount for this position
+            position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+            if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                self._strategy._pending_position_closes[position_key] = max(
+                    Decimal("0"), 
+                    self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                )
+                self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount for non-existent position: {position_key}")
+            
             self.close_type = CloseType.COMPLETED
             self.stop()
             return
@@ -833,6 +962,14 @@ class AssignmentAdapterExecutor(PositionExecutor):
                         if hasattr(connector, "_is_position_already_closed_error") and callable(connector._is_position_already_closed_error):
                             if connector._is_position_already_closed_error(Exception(error_msg)):
                                 self.logger().info(f"[ASSIGNMENT_ADAPTER] Connector confirmed position already closed: {error_msg}")
+                                # Clear pending close amount
+                                position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+                                if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                                    self._strategy._pending_position_closes[position_key] = max(
+                                        Decimal("0"), 
+                                        self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                                    )
+                                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount due to position already closed: {position_key}")
                                 self.close_type = CloseType.COMPLETED
                                 self.stop()
                                 return
@@ -842,6 +979,14 @@ class AssignmentAdapterExecutor(PositionExecutor):
                               "wouldnotreduceposition" in error_msg or
                               "position already closed" in error_msg):
                             self.logger().info(f"[ASSIGNMENT_ADAPTER] Detected position already closed from order error: {error_msg}")
+                            # Clear pending close amount
+                            position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+                            if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                                self._strategy._pending_position_closes[position_key] = max(
+                                    Decimal("0"), 
+                                    self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                                )
+                                self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount due to position already closed: {position_key}")
                             self.close_type = CloseType.COMPLETED
                             self.stop()
                             return
@@ -849,6 +994,17 @@ class AssignmentAdapterExecutor(PositionExecutor):
                     # Check if close order is done or filled
                     if in_flight_order.is_done or in_flight_order.is_filled:
                         self.logger().debug(f"[ASSIGNMENT_ADAPTER] Close order is done or filled, marking as completed")
+                        
+                        # Clear pending close amount for this position since the order completed successfully
+                        position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+                        if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                            filled_amount = in_flight_order.executed_amount_base if in_flight_order.executed_amount_base > Decimal("0") else self._assigned_amount
+                            self._strategy._pending_position_closes[position_key] = max(
+                                Decimal("0"), 
+                                self._strategy._pending_position_closes[position_key] - filled_amount
+                            )
+                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount ({filled_amount}) after order completion for {position_key}")
+                        
                         self.close_type = CloseType.COMPLETED
                         self.stop()
                         return
@@ -856,6 +1012,14 @@ class AssignmentAdapterExecutor(PositionExecutor):
                     # Double-check if position still exists after processing order
                     if not await self.check_if_position_exists():
                         self.logger().debug(f"[ASSIGNMENT_ADAPTER] Position no longer exists after order update, marking as completed")
+                        # Clear pending close amount
+                        position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+                        if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                            self._strategy._pending_position_closes[position_key] = max(
+                                Decimal("0"), 
+                                self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                            )
+                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount for position that no longer exists: {position_key}")
                         self.close_type = CloseType.COMPLETED
                         self.stop()
                         return
@@ -868,6 +1032,14 @@ class AssignmentAdapterExecutor(PositionExecutor):
                     if hasattr(connector, "_is_position_already_closed_error") and callable(connector._is_position_already_closed_error):
                         if connector._is_position_already_closed_error(e):
                             self.logger().info(f"[ASSIGNMENT_ADAPTER] Connector confirmed position already closed: {error_str}")
+                            # Clear pending close amount
+                            position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+                            if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                                self._strategy._pending_position_closes[position_key] = max(
+                                    Decimal("0"), 
+                                    self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                                )
+                                self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount due to error indicating position closed: {position_key}")
                             self.close_type = CloseType.COMPLETED
                             self.stop()
                             return
@@ -877,6 +1049,14 @@ class AssignmentAdapterExecutor(PositionExecutor):
                           "wouldnotreduceposition" in error_str or
                           "position already closed" in error_str):
                         self.logger().info(f"[ASSIGNMENT_ADAPTER] Error indicates position already closed: {e}")
+                        # Clear pending close amount
+                        position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+                        if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                            self._strategy._pending_position_closes[position_key] = max(
+                                Decimal("0"), 
+                                self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                            )
+                            self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount due to error indicating position closed: {position_key}")
                         self.close_type = CloseType.COMPLETED
                         self.stop()
                         return
@@ -888,6 +1068,14 @@ class AssignmentAdapterExecutor(PositionExecutor):
                 # Check if position is already closed before adding to failed orders
                 if not await self.check_if_position_exists():
                     self.logger().info(f"[ASSIGNMENT_ADAPTER] Position is already closed, marking executor as completed")
+                    # Clear pending close amount
+                    position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+                    if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                        self._strategy._pending_position_closes[position_key] = max(
+                            Decimal("0"), 
+                            self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                        )
+                        self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount for already closed position: {position_key}")
                     self.close_type = CloseType.COMPLETED
                     self.stop()
                     return
@@ -899,6 +1087,14 @@ class AssignmentAdapterExecutor(PositionExecutor):
             # Before placing a new close order, check if position still exists
             if not await self.check_if_position_exists():
                 self.logger().info(f"[ASSIGNMENT_ADAPTER] Position is already closed, no need to place close order")
+                # Clear pending close amount
+                position_key = f"{self.config.connector_name}_{self.config.trading_pair}"
+                if hasattr(self._strategy, "_pending_position_closes") and position_key in self._strategy._pending_position_closes:
+                    self._strategy._pending_position_closes[position_key] = max(
+                        Decimal("0"), 
+                        self._strategy._pending_position_closes[position_key] - self._assigned_amount
+                    )
+                    self.logger().info(f"[ASSIGNMENT_ADAPTER] Cleared pending close amount for already closed position: {position_key}")
                 self.close_type = CloseType.COMPLETED
                 self.stop()
                 return

@@ -29,11 +29,11 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.event.events import AssignmentFillEvent, MarketEvent
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
-from hummingbot.core.event.events import AssignmentFillEvent, MarketEvent
 
 if TYPE_CHECKING:
     from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -1139,8 +1139,16 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
         Process a single order from WebSocket.
         :param order_data: The order data.
         """
+        # Check if this is from open_orders_verbose feed format which has a nested 'order' structure
+        if "feed" in order_data and order_data.get("feed") == "open_orders_verbose" and "order" in order_data:
+            actual_order = order_data["order"]
+            # Extract client order ID
+            client_order_id = str(actual_order.get("cli_ord_id", ""))
+        else:
+            # Standard format
+            client_order_id = str(order_data.get("cli_ord_id", ""))
+        
         # Skip if no client order ID
-        client_order_id = str(order_data.get("cli_ord_id", ""))
         if not client_order_id:
             self.logger().debug(f"No client order ID in order data: {order_data}")
             return
@@ -1151,24 +1159,36 @@ class KrakenPerpetualDerivative(PerpetualDerivativePyBase):
             self.logger().debug(f"Order {client_order_id} not found in order tracker")
             return
         
-        # Get order status
-        order_status = order_data.get("status", "")
+        # Determine which structure to use for remaining fields based on message format
+        if "feed" in order_data and order_data.get("feed") == "open_orders_verbose" and "order" in order_data:
+            actual_order = order_data["order"]
+            # Get order status
+            order_status = actual_order.get("status", "")
+            if not order_status and "reason" in order_data:
+                order_status = order_data.get("reason", "")
+            
+            # Get filled amount
+            filled_amount = Decimal(str(actual_order.get("filled", "0")))
+            total_amount = Decimal(str(actual_order.get("qty", "0")))
+            
+            # Get exchange order ID
+            exchange_order_id = str(actual_order.get("order_id", ""))
+            
+            # Get timestamp
+            timestamp = actual_order.get("last_update_time", int(time.time() * 1000))
+        else:
+            # Standard format
+            order_status = order_data.get("status", "")
+            filled_amount = Decimal(str(order_data.get("filled", "0")))
+            total_amount = Decimal(str(order_data.get("size", "0")))
+            exchange_order_id = str(order_data.get("order_id", ""))
+            timestamp = order_data.get("last_update_time", int(time.time() * 1000))
         
         # Map Kraken status to Hummingbot status
         new_state = CONSTANTS.ORDER_STATE.get(order_status, None)
         if new_state is None:
             self.logger().warning(f"Unknown order status: {order_status}")
             return
-        
-        # Get filled amount
-        filled_amount = Decimal(str(order_data.get("filled", "0")))
-        total_amount = Decimal(str(order_data.get("size", "0")))
-        
-        # Get exchange order ID
-        exchange_order_id = str(order_data.get("order_id", ""))
-        
-        # Get timestamp
-        timestamp = order_data.get("last_update_time", int(time.time() * 1000))
         
         self.logger().info(f"\nCreating order update:"
                           f"\n  Client Order ID: {client_order_id}"

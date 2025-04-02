@@ -1,11 +1,11 @@
+import inspect
 import logging
+import sys
+import traceback
 import uuid
 from copy import deepcopy
 from decimal import Decimal
 from typing import Dict, List
-import inspect
-import sys
-import traceback
 
 from pydantic.v1.main import BaseModel
 
@@ -217,9 +217,6 @@ class ExecutorOrchestrator:
             self.cached_performance[controller_id] = PerformanceReport()
 
         if isinstance(action, CreateExecutorAction):
-            self.logger().info(f"Processing CreateExecutorAction with config type: {type(action.executor_config).__name__}")
-            # Print stack trace for where this config came from
-            print_config_source_trace(action.executor_config)
             self.create_executor(action)
         elif isinstance(action, StopExecutorAction):
             self.stop_executor(action)
